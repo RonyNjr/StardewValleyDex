@@ -33,6 +33,8 @@ from bs4 import BeautifulSoup
 
 WIKI_BASE = "https://pt.stardewvalleywiki.com"
 API_URL = f"{WIKI_BASE}/api.php"
+EN_WIKI_BASE = "https://stardewvalleywiki.com"
+EN_API_URL = f"{EN_WIKI_BASE}/api.php"
 USER_AGENT = "StardewValleyDex/0.1 (offline-wiki-dump; educational)"
 
 # Politeness delays (seconds)
@@ -277,14 +279,80 @@ def _fetch_titles_via_special_page(session: requests.Session) -> list[str]:
     return titles
 
 
-def fetch_page_html(session: requests.Session, title: str) -> Optional[str]:
-    """Fetch the fully-rendered HTML for a single wiki page."""
-    # MediaWiki accepts spaces or underscores; use underscores for the URL.
-    url = f"{WIKI_BASE}/{title.replace(' ', '_')}"
+def fetch_redirect_target(session: requests.Session, title: str) -> Optional[str]:
+    """
+    Ask the PT wiki API if `title` is a redirect page and return the redirect
+    target title. Returns None if the page is not a redirect or the API fails.
+    """
+    params = {
+        "action": "query",
+        "titles": title,
+        "redirects": "1",
+        "format": "json",
+    }
+    try:
+        resp = session.get(API_URL, params=params, timeout=15)
+        if not resp.ok:
+            return None
+        data = resp.json()
+        redirects = data.get("query", {}).get("redirects", [])
+        if redirects:
+            return redirects[-1].get("to")
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_en_title(session: requests.Session, pt_title: str) -> Optional[str]:
+    """Look up the English wiki equivalent of a PT title via the langlinks API."""
+    params = {
+        "action": "query",
+        "titles": pt_title,
+        "prop": "langlinks",
+        "lllang": "en",
+        "format": "json",
+    }
+    try:
+        resp = session.get(API_URL, params=params, timeout=15)
+        if not resp.ok:
+            return None
+        data = resp.json()
+        for page in data.get("query", {}).get("pages", {}).values():
+            for ll in page.get("langlinks", []):
+                if ll.get("lang") == "en":
+                    return ll.get("*")
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_html(session: requests.Session, title: str, base: str) -> tuple[Optional[str], int]:
+    from urllib.parse import quote
+    slug = quote(title.replace(" ", "_"), safe="/:@!$&'()*+,;=.-_~")
+    url = f"{base}/{slug}"
     resp = session.get(url, timeout=30)
     if resp.status_code != 200:
-        return None
-    return resp.text
+        return None, resp.status_code
+    return resp.text, 200
+
+
+def fetch_page_html(session: requests.Session, title: str) -> tuple[Optional[str], int, str]:
+    """
+    Fetch a wiki page. Tries PT wiki first; on 404 falls back to the EN wiki
+    via langlinks. Returns (html, status_code, source) where source is 'pt' or 'en'.
+    """
+    html, status = _fetch_html(session, title, WIKI_BASE)
+    if html is not None:
+        return html, status, "pt"
+
+    if status == 404:
+        en_title = _fetch_en_title(session, title) or title
+        html, en_status = _fetch_html(session, en_title, EN_WIKI_BASE)
+        if html is not None:
+            return html, en_status, f"en:{en_title}"
+        return None, en_status, "en"
+
+    return None, status, "pt"
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +574,23 @@ def existing_titles(conn: sqlite3.Connection) -> set[str]:
     return {row[0] for row in cur.fetchall()}
 
 
+def upsert_redirect(conn: sqlite3.Connection, from_title: str, to_title: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO redirects (from_title, to_title)
+        VALUES (?, ?)
+        ON CONFLICT(from_title) DO UPDATE SET to_title = excluded.to_title
+        """,
+        (from_title, to_title),
+    )
+    conn.commit()
+
+
+def existing_redirects(conn: sqlite3.Connection) -> set[str]:
+    cur = conn.execute("SELECT from_title FROM redirects")
+    return {row[0] for row in cur.fetchall()}
+
+
 def upsert_page(
     conn: sqlite3.Connection,
     title: str,
@@ -582,6 +667,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     conn = open_db(data_dir)
 
     already_done: set[str] = existing_titles(conn) if args.resume else set()
+    already_redirected: set[str] = existing_redirects(conn) if args.resume else set()
     if args.resume:
         print(f"Resume mode: {len(already_done)} pages already in DB will be skipped.")
 
@@ -598,16 +684,25 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     start_ts = time.time()
 
     for idx, title in enumerate(titles, start=1):
-        if title in already_done:
+        if title in already_done or title in already_redirected:
             skip_count += 1
             print(f"[{idx}/{total}] {title} ... (skip: already in DB)")
             continue
 
         print(f"[{idx}/{total}] {title} ...", end=" ", flush=True)
         try:
-            html = fetch_page_html(session, title)
+            html, status, source = fetch_page_html(session, title)
             if html is None:
-                print("x (HTTP error)")
+                if status == 404:
+                    # Check if the PT wiki knows this as a redirect page
+                    target = fetch_redirect_target(session, title)
+                    if target:
+                        upsert_redirect(conn, title, target)
+                        ok_count += 1
+                        print(f"ok (redirect → {target})")
+                        time.sleep(PAGE_SLEEP)
+                        continue
+                print(f"x (HTTP {status})")
                 fail_count += 1
                 time.sleep(PAGE_SLEEP)
                 continue
@@ -622,7 +717,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             last_modified = extract_last_modified(html)
             upsert_page(conn, title, processed, last_modified, categories)
             ok_count += 1
-            print("ok")
+            label = f"ok (EN: {source[3:]})" if source.startswith("en:") else "ok"
+            print(label)
         except Exception as e:  # noqa: BLE001 - dump script, keep going
             fail_count += 1
             print(f"x ({type(e).__name__}: {e})")

@@ -29,9 +29,9 @@ fn handle_request<R: Runtime>(
     let trimmed = raw_path.trim_start_matches('/');
     let decoded = url_decode(trimmed);
 
-    // Empty path -> route to Main_Page for convenience.
+    // Empty path -> route to the Portuguese main page.
     let target = if decoded.is_empty() {
-        "Main_Page".to_string()
+        "Página_Principal".to_string()
     } else {
         decoded
     };
