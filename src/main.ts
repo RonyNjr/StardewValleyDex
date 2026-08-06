@@ -1,1 +1,1 @@
-window.location.href = "wiki://localhost/Barco";
+window.location.href = "wiki://localhost/";

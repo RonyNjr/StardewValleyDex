@@ -89,7 +89,7 @@ def process(session: requests.Session, html: str, base: str) -> str:
             a["href"] = "wiki://localhost/" + href[len("/wiki/"):]
 
     for img in soup.find_all("img"):
-        img.pop("srcset", None)
+        img.attrs.pop("srcset", None)
         src = img.get("src", "")
         if src.startswith("data:") or not src:
             continue
@@ -207,14 +207,17 @@ def main() -> None:
     conn.commit()
     print(f"Fixed {fixed} quoted title(s) in DB.")
 
-    # 2. Fetch Página_Principal
+    # 2. Fetch Página_Principal — try Stardew_Valley_Wiki (actual main page on PT wiki)
     print("\nFetching Página_Principal...")
-    html = fetch(session, "Página_Principal", WIKI_PT)
-    if html:
-        processed = process(session, html, WIKI_PT)
-        upsert_page(conn, "Página_Principal", processed)
-        conn.commit()
-        print("  ok (PT wiki)")
+    home_html = None
+    for candidate in ["Stardew_Valley_Wiki", "Página_Principal"]:
+        home_html = fetch(session, candidate, WIKI_PT)
+        if home_html and "no text" not in home_html and len(home_html) > 2000:
+            processed = process(session, home_html, WIKI_PT)
+            upsert_page(conn, "Página_Principal", processed)
+            conn.commit()
+            print(f"  ok (PT wiki: {candidate})")
+            break
     else:
         print("  not found on PT wiki — creating stub")
         upsert_page(conn, "Página_Principal", stub_page("Página Principal"))
