@@ -447,15 +447,26 @@ def download_asset(
 # ---------------------------------------------------------------------------
 
 
+_ASSET_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".css", ".ttf", ".woff", ".woff2"}
+_SKIP_HREF = ("wiki://", "http://", "https://", "//", "#", "mailto:", "javascript:")
+
+
 def _rewrite_wiki_link(href: str) -> Optional[str]:
     """
-    Rewrite `/wiki/Foo` or `/wiki/Foo#section` into `wiki://localhost/Foo...`.
-    Returns None if the href isn't a wiki link we can rewrite.
+    Rewrite internal wiki links to wiki://localhost/... .
+    Handles both /wiki/Foo (standard MediaWiki) and /Foo (short-URL wikis).
+    Returns None if the href should be left untouched (assets, external, anchors).
     """
-    if not href.startswith("/wiki/"):
+    if any(href.startswith(p) for p in _SKIP_HREF):
         return None
-    remainder = href[len("/wiki/"):]
-    return f"wiki://localhost/{remainder}"
+    if href.startswith("/wiki/"):
+        return "wiki://localhost/" + href[len("/wiki/"):]
+    if href.startswith("/"):
+        path = href.split("?")[0].split("#")[0]
+        if any(path.lower().endswith(ext) for ext in _ASSET_EXTS):
+            return None
+        return f"wiki://localhost{href}"
+    return None
 
 
 def process_html(

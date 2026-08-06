@@ -83,10 +83,18 @@ def process(session: requests.Session, html: str, base: str) -> str:
     for tag in soup.find_all("script"):
         tag.decompose()
 
+    _skip = ("wiki://", "http://", "https://", "//", "#", "mailto:", "javascript:")
+    _asset_exts = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".css", ".ttf", ".woff", ".woff2"}
     for a in soup.find_all("a", href=True):
         href = a["href"]
+        if any(href.startswith(p) for p in _skip):
+            continue
         if href.startswith("/wiki/"):
             a["href"] = "wiki://localhost/" + href[len("/wiki/"):]
+        elif href.startswith("/"):
+            path = href.split("?")[0].split("#")[0]
+            if not any(path.lower().endswith(ext) for ext in _asset_exts):
+                a["href"] = f"wiki://localhost{href}"
 
     for img in soup.find_all("img"):
         img.attrs.pop("srcset", None)
