@@ -176,7 +176,7 @@ def _extract_title_from_url(url: str, titles: list) -> None:
     for prefix in [f"{WIKI_BASE}/wiki/", f"{WIKI_BASE}/"]:
         if url.startswith(prefix):
             raw = url[len(prefix):].split("#")[0].split("?")[0]
-            title = unquote(raw).replace("_", " ")
+            title = unquote(raw).replace("_", " ").strip().strip('"').strip("'")
             if title and not any(title.startswith(ns + ":") for ns in SKIP_NS):
                 titles.append(title)
             return
@@ -244,7 +244,7 @@ def _fetch_titles_via_special_page(session: requests.Session) -> list[str]:
                 continue
 
             raw = raw.split("#")[0].split("?")[0]
-            title = unquote(raw).replace("_", " ")
+            title = unquote(raw).replace("_", " ").strip().strip('"').strip("'")
 
             if not title:
                 continue

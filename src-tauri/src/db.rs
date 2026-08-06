@@ -52,7 +52,7 @@ pub fn get_page(conn: &Connection, title: &str) -> Option<String> {
     let effective_title = redirect_target.unwrap_or_else(|| title.to_string());
 
     conn.query_row(
-        "SELECT html FROM pages WHERE title = ?1",
+        "SELECT html FROM pages WHERE TRIM(title, '\"') = ?1",
         params![effective_title],
         |row| row.get::<_, String>(0),
     )

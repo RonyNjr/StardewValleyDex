@@ -51,14 +51,44 @@ fn handle_request<R: Runtime>(
     };
 
     match db::get_page(&conn, &target) {
-        Some(html) => Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/html; charset=utf-8")
-            .header("Access-Control-Allow-Origin", "*")
-            .body(html.into_bytes())
-            .unwrap_or_else(|_| internal_error("Failed to build response")),
+        Some(html) => {
+            let page = inject_header(&html, &target);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/html; charset=utf-8")
+                .header("Access-Control-Allow-Origin", "*")
+                .body(page.into_bytes())
+                .unwrap_or_else(|_| internal_error("Failed to build response"))
+        }
         None => not_found(&target),
     }
+}
+
+const HEADER_HTML: &str = r#"<style>html,body{background-color:#a7c4d4!important}</style>
+<div id="svd-header" style="display:flex;align-items:center;gap:16px;padding:10px 20px;background:#2d5a1b;color:#fff;position:sticky;top:0;z-index:9999;font-family:sans-serif">
+  <span style="font-weight:bold;font-size:1.1rem;cursor:pointer;white-space:nowrap" onclick="window.location='wiki://localhost/'">StardewValleyDex</span>
+  <form style="display:flex;flex:1;gap:8px;max-width:700px" onsubmit="event.preventDefault();var t=document.getElementById('svd-q').value.trim().replace(/\s+/g,'_');if(t)window.location='wiki://localhost/'+encodeURIComponent(t)">
+    <input id="svd-q" type="text" placeholder="Título da página (ex: Mining)" style="flex:1;padding:6px 12px;border:none;border-radius:4px;font-size:.95rem"/>
+    <button type="submit" style="padding:6px 16px;background:#5a3a1a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:.95rem">Ir</button>
+  </form>
+</div>"#;
+
+fn inject_header(html: &str, _title: &str) -> String {
+    let header = HEADER_HTML;
+    // Insert right after the opening <body> tag (case-insensitive search)
+    let lower = html.to_lowercase();
+    if let Some(pos) = lower.find("<body") {
+        if let Some(close) = lower[pos..].find('>') {
+            let insert_at = pos + close + 1;
+            let mut out = String::with_capacity(html.len() + header.len());
+            out.push_str(&html[..insert_at]);
+            out.push_str(header);
+            out.push_str(&html[insert_at..]);
+            return out;
+        }
+    }
+    // Fallback: prepend
+    format!("{}{}", header, html)
 }
 
 fn serve_asset(assets_dir: &PathBuf, rel_path: &str, ext: &str) -> Response<Vec<u8>> {
