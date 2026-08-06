@@ -41,7 +41,7 @@ pub fn get_page(conn: &Connection, title: &str) -> Option<String> {
     // First: try to resolve a redirect.
     let redirect_target: Option<String> = conn
         .query_row(
-            "SELECT to_title FROM redirects WHERE from_title = ?1",
+            "SELECT to_title FROM redirects WHERE REPLACE(from_title,'_',' ') = REPLACE(?1,'_',' ')",
             params![title],
             |row| row.get::<_, String>(0),
         )
@@ -52,7 +52,7 @@ pub fn get_page(conn: &Connection, title: &str) -> Option<String> {
     let effective_title = redirect_target.unwrap_or_else(|| title.to_string());
 
     conn.query_row(
-        "SELECT html FROM pages WHERE TRIM(title, '\"') = ?1",
+        "SELECT html FROM pages WHERE REPLACE(TRIM(title,'\"'),'_',' ') = REPLACE(?1,'_',' ')",
         params![effective_title],
         |row| row.get::<_, String>(0),
     )

@@ -8,6 +8,14 @@ use rusqlite::Connection;
 use tauri::Manager;
 
 #[tauri::command]
+fn open_url(url: String, app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(url, None::<String>)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn navigate_to(
     title: String,
     state: tauri::State<'_, Mutex<Connection>>,
@@ -54,7 +62,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![navigate_to])
+        .invoke_handler(tauri::generate_handler![navigate_to, open_url])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

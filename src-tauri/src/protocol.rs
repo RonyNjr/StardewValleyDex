@@ -29,11 +29,11 @@ fn handle_request<R: Runtime>(
     let trimmed = raw_path.trim_start_matches('/');
     let decoded = url_decode(trimmed);
 
-    // Empty path -> route to the Portuguese main page.
+    // Empty path -> Portuguese main page. Underscores are spaces in MediaWiki.
     let target = if decoded.is_empty() {
-        "Página_Principal".to_string()
+        "Página Principal".to_string()
     } else {
-        decoded
+        decoded.replace('_', " ")
     };
 
     // Assets: files with a recognised extension are served from disk.
@@ -65,6 +65,17 @@ fn handle_request<R: Runtime>(
 }
 
 const HEADER_HTML: &str = r#"<style>html,body{background-color:#a7c4d4!important}</style>
+<script>
+document.addEventListener('click',function(e){
+  var a=e.target.closest('a');
+  if(!a)return;
+  var h=a.getAttribute('href')||'';
+  if(h.startsWith('http://')||h.startsWith('https://')){
+    e.preventDefault();
+    if(window.__TAURI_INTERNALS__)window.__TAURI_INTERNALS__.invoke('open_url',{url:h}).catch(function(){});
+  }
+},true);
+</script>
 <div id="svd-header" style="display:flex;align-items:center;gap:16px;padding:10px 20px;background:#2d5a1b;color:#fff;position:sticky;top:0;z-index:9999;font-family:sans-serif">
   <span style="font-weight:bold;font-size:1.1rem;cursor:pointer;white-space:nowrap" onclick="window.location='wiki://localhost/'">StardewValleyDex</span>
   <form style="display:flex;flex:1;gap:8px;max-width:700px" onsubmit="event.preventDefault();var t=document.getElementById('svd-q').value.trim().replace(/\s+/g,'_');if(t)window.location='wiki://localhost/'+encodeURIComponent(t)">
