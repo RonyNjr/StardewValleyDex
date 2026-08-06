@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>StardewValleyDex</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <header id="app-header">
+      <span class="brand" id="brand" title="Ir para a página inicial">StardewValleyDex</span>
+      <form id="search-form" autocomplete="off">
+        <input
+          type="text"
+          id="search-input"
+          name="title"
+          placeholder="Título da página (ex: Mining)"
+        />
+        <button type="submit">Ir</button>
+      </form>
+    </header>
+
+    <iframe
+      id="wiki-frame"
+      src="wiki://localhost/"
+      title="Stardew Valley Wiki (offline)"
+      allow="fullscreen"
+    ></iframe>
+  </body>
+</html>
