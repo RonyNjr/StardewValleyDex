@@ -68,17 +68,34 @@ CREATE TABLE IF NOT EXISTS redirects (
 # ---------------------------------------------------------------------------
 
 
-def make_session() -> requests.Session:
+def make_session(verify_ssl: bool = True) -> requests.Session:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
+    session.verify = verify_ssl
     return session
 
 
 def fetch_all_titles(session: requests.Session) -> list[str]:
     """
-    Enumerate every page title in the main namespace via
-    ?action=query&list=allpages, following `continue` tokens until done.
+    Get all page titles. Tries the MediaWiki API first; if the allpages
+    module is disabled (common on restricted wikis), falls back to scraping
+    Special:AllPages.
     """
+    print("Listing pages via MediaWiki API...")
+    try:
+        titles = _fetch_titles_via_api(session)
+        print(f"  found {len(titles)} pages (via API)")
+        return titles
+    except RuntimeError as e:
+        if "404" in str(e):
+            print("  allpages API module disabled — falling back to Special:AllPages scraping...")
+            titles = _fetch_titles_via_special_page(session)
+            print(f"  found {len(titles)} pages (via Special:AllPages)")
+            return titles
+        raise
+
+
+def _fetch_titles_via_api(session: requests.Session) -> list[str]:
     titles: list[str] = []
     params: dict[str, str] = {
         "action": "query",
@@ -87,26 +104,176 @@ def fetch_all_titles(session: requests.Session) -> list[str]:
         "format": "json",
     }
 
-    print("Listing pages via MediaWiki API...")
     while True:
         resp = session.get(API_URL, params=params, timeout=30)
-        resp.raise_for_status()
+        if not resp.ok:
+            preview = resp.text[:300].replace("\n", " ")
+            raise RuntimeError(
+                f"API returned HTTP {resp.status_code} for {resp.url}\n  Body: {preview}"
+            )
         data = resp.json()
-
         for page in data.get("query", {}).get("allpages", []):
             titles.append(page["title"])
-
         cont = data.get("continue")
         if not cont:
             break
-
-        # Merge every continue key back into the params (usually apcontinue).
-        for key, value in cont.items():
-            params[key] = value
-
+        params.update(cont)
         time.sleep(API_SLEEP)
 
-    print(f"  found {len(titles)} pages")
+    return titles
+
+
+def _fetch_titles_via_sitemap(session: requests.Session) -> list[str]:
+    """Try to get all titles from the wiki sitemap XML."""
+    import xml.etree.ElementTree as ET
+
+    for sitemap_url in [
+        f"{WIKI_BASE}/sitemap.xml",
+        f"{WIKI_BASE}/sitemap-index.xml",
+        f"{WIKI_BASE}/sitemap_index.xml",
+    ]:
+        resp = session.get(sitemap_url, timeout=30)
+        if not resp.ok:
+            continue
+
+        try:
+            root = ET.fromstring(resp.text)
+        except ET.ParseError:
+            continue
+
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        titles: list[str] = []
+
+        # sitemap index → fetch each child sitemap
+        for loc in root.findall(".//sm:loc", ns):
+            url = loc.text or ""
+            if "sitemap" in url and url != sitemap_url:
+                sub = session.get(url, timeout=30)
+                if sub.ok:
+                    try:
+                        sub_root = ET.fromstring(sub.text)
+                        for sub_loc in sub_root.findall(".//sm:loc", ns):
+                            page_url = sub_loc.text or ""
+                            _extract_title_from_url(page_url, titles)
+                    except ET.ParseError:
+                        pass
+            else:
+                _extract_title_from_url(url, titles)
+
+        if titles:
+            print(f"  (sitemap: {sitemap_url})")
+            return titles
+
+    return []
+
+
+def _extract_title_from_url(url: str, titles: list) -> None:
+    SKIP_NS = (
+        "Especial", "Special", "Ficheiro", "File", "Ajuda", "Help",
+        "Predefinição", "Template", "Categoria", "Category",
+        "Módulo", "Module", "MediaWiki", "Usuário", "User", "Discussão",
+    )
+    for prefix in [f"{WIKI_BASE}/wiki/", f"{WIKI_BASE}/"]:
+        if url.startswith(prefix):
+            raw = url[len(prefix):].split("#")[0].split("?")[0]
+            title = unquote(raw).replace("_", " ")
+            if title and not any(title.startswith(ns + ":") for ns in SKIP_NS):
+                titles.append(title)
+            return
+
+
+def _fetch_titles_via_special_page(session: requests.Session) -> list[str]:
+    """
+    Scrape Special:AllPages. Tries the sitemap first, then the special page
+    with a broad CSS selector to handle custom wiki skins.
+    """
+    # Try sitemap first — it's more reliable
+    titles = _fetch_titles_via_sitemap(session)
+    if titles:
+        return titles
+
+    START_URLS = [
+        f"{WIKI_BASE}/Especial:Todas_as_p%C3%A1ginas",
+        f"{WIKI_BASE}/Special:AllPages",
+        f"{WIKI_BASE}/index.php?title=Special:AllPages",
+    ]
+
+    start_url: Optional[str] = None
+    for candidate in START_URLS:
+        r = session.get(candidate, timeout=30, allow_redirects=True)
+        if r.ok:
+            start_url = r.url
+            break
+
+    if not start_url:
+        raise RuntimeError("Could not reach Special:AllPages or sitemap on this wiki.")
+
+    SKIP_NS = (
+        "Especial", "Special", "Ficheiro", "File", "Ajuda", "Help",
+        "Predefinição", "Template", "Categoria", "Category",
+        "Módulo", "Module", "MediaWiki", "Usuário", "User", "Discussão",
+    )
+
+    titles = []
+    url: Optional[str] = start_url
+
+    while url:
+        resp = session.get(url, timeout=30)
+        if not resp.ok:
+            break
+
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # Try multiple selectors — different skins use different classes
+        candidates = soup.select(
+            ".mw-allpages-body a, "
+            ".mw-allpages-chunk a, "
+            "#mw-content-text li a, "
+            "#mw-content-text td a"
+        )
+
+        found_on_page = 0
+        for a in candidates:
+            href = a.get("href", "")
+            # Handle both /wiki/X and /X URL formats
+            if "/wiki/" in href:
+                raw = href.split("/wiki/", 1)[1]
+            elif href.startswith("/") and not href.startswith("//"):
+                raw = href.lstrip("/")
+            else:
+                continue
+
+            raw = raw.split("#")[0].split("?")[0]
+            title = unquote(raw).replace("_", " ")
+
+            if not title:
+                continue
+            if any(title.startswith(ns + ":") for ns in SKIP_NS):
+                continue
+
+            titles.append(title)
+            found_on_page += 1
+
+        if found_on_page == 0:
+            # Debug: print a snippet of the page HTML to help diagnose selector issues
+            content = soup.select_one("#mw-content-text")
+            if content:
+                print(f"\n  [DEBUG] #mw-content-text snippet (first 400 chars):")
+                print(f"  {str(content)[:400]}")
+            break
+
+        # Follow pagination — look for any link containing "from=" in the nav area
+        url = None
+        for nav_a in soup.select(".mw-allpages-nav a, #mw-content-text a"):
+            text = nav_a.get_text(strip=True).lower()
+            href = nav_a.get("href", "")
+            if ("próxim" in text or "next" in text) and "from=" in href:
+                url = urljoin(WIKI_BASE, href)
+                break
+
+        if url:
+            time.sleep(API_SLEEP)
+
     return titles
 
 
@@ -389,6 +556,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Print a line for each asset that gets downloaded.",
     )
+    parser.add_argument(
+        "--no-ssl-verify",
+        action="store_true",
+        help="Disable SSL certificate verification (workaround for LibreSSL on macOS).",
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -402,7 +574,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     print(f"Data directory: {data_dir}")
     print(f"Assets directory: {assets_dir}")
 
-    session = make_session()
+    if args.no_ssl_verify:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        print("WARNING: SSL verification disabled.")
+    session = make_session(verify_ssl=not args.no_ssl_verify)
     conn = open_db(data_dir)
 
     already_done: set[str] = existing_titles(conn) if args.resume else set()
