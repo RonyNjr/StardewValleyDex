@@ -264,12 +264,12 @@ def _fetch_titles_via_special_page(session: requests.Session) -> list[str]:
                 print(f"  {str(content)[:400]}")
             break
 
-        # Follow pagination — look for any link containing "from=" in the nav area
+        # Follow pagination — PT wiki uses "Página seguinte"; also handle "next"/"próxim"
         url = None
         for nav_a in soup.select(".mw-allpages-nav a, #mw-content-text a"):
             text = nav_a.get_text(strip=True).lower()
             href = nav_a.get("href", "")
-            if ("próxim" in text or "next" in text) and "from=" in href:
+            if ("seguinte" in text or "próxim" in text or "next" in text) and "from=" in href:
                 url = urljoin(WIKI_BASE, href)
                 break
 
