@@ -40,7 +40,7 @@ fn handle_request<R: Runtime>(
     if let Some(ext) = extension_of(&target) {
         if is_asset_extension(&ext) {
             if target == "stardewbackground.png" {
-                static BG: &[u8] = include_bytes!("../stardewbackground.png");
+                static BG: &[u8] = include_bytes!("../resources/stardewbackground.png");
                 return Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", "image/png")
