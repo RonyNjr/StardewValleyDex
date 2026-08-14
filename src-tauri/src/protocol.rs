@@ -90,6 +90,37 @@ document.addEventListener('click',function(e){
     if(window.__TAURI_INTERNALS__)window.__TAURI_INTERNALS__.invoke('open_url',{url:h}).catch(function(){});
   }
 },true);
+
+(function(){
+  function svdInjectCard(){
+    if(location.pathname!=='/') return;
+    var content=document.querySelector('#mw-content-text');
+    if(!content) return;
+    var slot=null,divs=content.querySelectorAll('div');
+    for(var i=0;i<divs.length;i++){if(divs[i].innerHTML.trim()===''){slot=divs[i];break;}}
+    if(!slot) return;
+    var pages=[
+      ['⛏️','Mineração'],['🌱','Culturas'],
+      ['🎣','Pesca'],['🍳','Culinária'],
+      ['👥','Aldeões'],['❤️','Amizade'],
+      ['🐄','Animais'],['🔨','Artesanato']
+    ];
+    var grid=pages.map(function(p){
+      return '<a href="wiki://localhost/'+encodeURIComponent(p[1])+'" style="display:flex;align-items:center;gap:7px;padding:8px 12px;background:rgba(255,255,255,0.1);border-radius:10px;text-decoration:none;color:#fff;font-size:.82rem;border:1px solid rgba(255,255,255,0.12)">'+p[0]+' '+p[1]+'</a>';
+    }).join('');
+    slot.style.cssText='background:rgba(20,50,10,0.48);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);border-radius:16px;border:1px solid rgba(255,255,255,0.15);padding:20px 24px;display:flex;gap:24px;align-items:flex-start;box-shadow:0 4px 24px rgba(0,0,0,0.18),inset 0 1px 0 rgba(255,255,255,0.12);font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;color:#fff;margin:4px;box-sizing:border-box';
+    slot.innerHTML=
+      '<div style="flex:0 0 auto;max-width:190px">'+
+        '<div style="font-weight:700;font-size:.95rem;margin-bottom:8px">🌾 StardewValleyDex</div>'+
+        '<div style="font-size:.78rem;line-height:1.6;opacity:.85;margin-bottom:16px">Wiki completa de Stardew Valley disponível offline, em Português.</div>'+
+        '<a href="https://github.com/RonyNjr/StardewValleyDex" style="display:inline-flex;align-items:center;gap:6px;padding:7px 16px;background:rgba(255,255,255,0.15);border:1px solid rgba(255,255,255,0.25);border-radius:50px;text-decoration:none;color:#fff;font-size:.78rem;font-weight:600">⭐ GitHub</a>'+
+      '</div>'+
+      '<div style="width:1px;background:rgba(255,255,255,0.12);align-self:stretch;flex-shrink:0"></div>'+
+      '<div style="flex:1;display:grid;grid-template-columns:1fr 1fr;gap:8px">'+grid+'</div>';
+  }
+  if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',svdInjectCard);}
+  else{svdInjectCard();}
+})();
 </script>
 <div id="svd-header" style="display:flex;align-items:center;gap:14px;padding:10px 18px;margin:12px auto 0;max-width:960px;width:calc(100% - 32px);background:rgba(30,60,15,0.5);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);color:#fff;position:sticky;top:12px;z-index:9999;border-radius:22px;border:1px solid rgba(255,255,255,0.18);box-shadow:0 4px 32px rgba(0,0,0,0.2),inset 0 1px 0 rgba(255,255,255,0.18);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
   <button id="svd-back" onclick="history.back()" style="display:flex;align-items:center;gap:6px;background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.18);color:#fff;border-radius:50px;padding:6px 14px;cursor:pointer;font-size:.82rem;font-family:inherit;white-space:nowrap">← Voltar</button>
