@@ -12,6 +12,7 @@ Usage:
     python3 scripts/dump.py --limit 5              # only 5 pages (for testing)
     python3 scripts/dump.py --resume               # skip pages already in SQLite
     python3 scripts/dump.py --data-dir ./tmp       # override data directory
+    python3 scripts/dump.py --workers 16           # override HTTP concurrency
 
     # Link-graph closure pass: after the main dump, scan stored HTML for
     # wiki://localhost/ links that point at pages not yet in the DB, and
@@ -29,13 +30,17 @@ import hashlib
 import re
 import sqlite3
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import quote, urljoin, urlparse, unquote
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 WIKI_BASE = "https://pt.stardewvalleywiki.com"
 API_URL = f"{WIKI_BASE}/api.php"
@@ -43,9 +48,12 @@ EN_WIKI_BASE = "https://stardewvalleywiki.com"
 EN_API_URL = f"{EN_WIKI_BASE}/api.php"
 USER_AGENT = "StardewValleyDex/0.1 (offline-wiki-dump; educational)"
 
-# Politeness delays (seconds)
-PAGE_SLEEP = 0.5
+# Politeness delays (seconds). With concurrent workers the effective request
+# rate is roughly WORKERS / PAGE_SLEEP; keep the per-worker delay small but
+# non-zero so we still throttle a bit.
+PAGE_SLEEP = 0.05
 API_SLEEP = 0.1
+DEFAULT_WORKERS = 8
 
 # Elements to strip out of the wiki HTML entirely (original MediaWiki chrome).
 STRIP_SELECTORS = ["#mw-head", "#mw-head-base", "#mw-page-base"]
@@ -83,10 +91,29 @@ CREATE TABLE IF NOT EXISTS redirects (
 # ---------------------------------------------------------------------------
 
 
-def make_session(verify_ssl: bool = True) -> requests.Session:
+def make_session(verify_ssl: bool = True, pool_size: int = 32) -> requests.Session:
+    """
+    Build a requests.Session with a larger connection pool and basic retries.
+    A single Session is safe to share across threads for typical GET workloads.
+    """
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     session.verify = verify_ssl
+
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+        max_retries=retry,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
     return session
 
 
@@ -393,6 +420,24 @@ def _local_path_for_css(url: str, assets_dir: Path) -> tuple[Path, str]:
     return assets_dir / rel, rel
 
 
+# Process-wide asset cache to avoid re-checking disk / redownloading the same
+# asset repeatedly across pages. Maps normalized URL -> rel path (or None if
+# the download previously failed).
+_ASSET_CACHE: dict[str, Optional[str]] = {}
+_ASSET_LOCK = threading.Lock()
+# Per-URL locks so two concurrent workers don't race on the same download.
+_INFLIGHT_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _asset_lock_for(url: str) -> threading.Lock:
+    with _ASSET_LOCK:
+        lock = _INFLIGHT_LOCKS.get(url)
+        if lock is None:
+            lock = threading.Lock()
+            _INFLIGHT_LOCKS[url] = lock
+        return lock
+
+
 def download_asset(
     session: requests.Session,
     url: str,
@@ -408,35 +453,54 @@ def download_asset(
     if not url.startswith("http"):
         return None
 
+    # Fast path: process-wide cache.
+    cached = _ASSET_CACHE.get(url)
+    if cached is not None or url in _ASSET_CACHE:
+        return cached
+
     if is_css:
         local_path, rel_path = _local_path_for_css(url, assets_dir)
     else:
         local_path, rel_path = _local_path_for_asset(url, assets_dir)
 
-    if local_path.exists() and local_path.stat().st_size > 0:
-        return rel_path
+    # Serialize concurrent downloads of the same URL.
+    lock = _asset_lock_for(url)
+    with lock:
+        # Re-check cache once we hold the lock.
+        if url in _ASSET_CACHE:
+            return _ASSET_CACHE[url]
 
-    if verbose:
-        print(f"  -> downloading {rel_path}")
-
-    try:
-        resp = session.get(url, timeout=30, stream=True)
-        if resp.status_code != 200:
-            return None
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(local_path, "wb") as fh:
-            for chunk in resp.iter_content(chunk_size=64 * 1024):
-                if chunk:
-                    fh.write(chunk)
-        return rel_path
-    except requests.RequestException:
-        # Clean up any partial file we may have created.
         try:
-            if local_path.exists() and local_path.stat().st_size == 0:
-                local_path.unlink()
+            if local_path.exists() and local_path.stat().st_size > 0:
+                _ASSET_CACHE[url] = rel_path
+                return rel_path
         except OSError:
             pass
-        return None
+
+        if verbose:
+            print(f"  -> downloading {rel_path}")
+
+        try:
+            resp = session.get(url, timeout=30, stream=True)
+            if resp.status_code != 200:
+                _ASSET_CACHE[url] = None
+                return None
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(local_path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+            _ASSET_CACHE[url] = rel_path
+            return rel_path
+        except requests.RequestException:
+            # Clean up any partial file we may have created.
+            try:
+                if local_path.exists() and local_path.stat().st_size == 0:
+                    local_path.unlink()
+            except OSError:
+                pass
+            _ASSET_CACHE[url] = None
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -454,14 +518,16 @@ def _rewrite_wiki_link(href: str) -> Optional[str]:
     Handles both /wiki/Foo (standard MediaWiki) and /Foo (short-URL wikis).
     Returns None if the href should be left untouched (assets, external, anchors).
     """
-    if any(href.startswith(p) for p in _SKIP_HREF):
+    if href.startswith(_SKIP_HREF):
         return None
     if href.startswith("/wiki/"):
         return "wiki://localhost/" + href[len("/wiki/"):]
     if href.startswith("/"):
-        path = href.split("?")[0].split("#")[0]
-        if any(path.lower().endswith(ext) for ext in _ASSET_EXTS):
-            return None
+        path = href.split("?", 1)[0].split("#", 1)[0]
+        low = path.lower()
+        for ext in _ASSET_EXTS:
+            if low.endswith(ext):
+                return None
         return f"wiki://localhost{href}"
     return None
 
@@ -472,11 +538,14 @@ def process_html(
     assets_dir: Path,
     asset_counter: list[int],
     verbose_assets: bool = False,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """
-    Clean up and rewrite one page's HTML. Returns (processed_html, categories).
+    Clean up and rewrite one page's HTML. Returns
+    (processed_html, categories, last_modified).
+
     `asset_counter` is a single-element list used to accumulate a running
-    total of assets downloaded (for the final summary).
+    total of assets downloaded (for the final summary). We also extract the
+    last-modified footer here so we only build one BeautifulSoup tree per page.
     """
     soup = BeautifulSoup(html, "lxml")
 
@@ -500,9 +569,7 @@ def process_html(
             img["srcset"] = ""
 
         src = img.get("src")
-        if not src:
-            continue
-        if src.startswith("data:"):
+        if not src or src.startswith("data:"):
             continue
 
         # Only rewrite same-origin / protocol-relative wiki assets.
@@ -516,18 +583,16 @@ def process_html(
 
     # 4. Rewrite stylesheets similarly.
     for link in soup.find_all("link"):
-        rel = link.get("rel") or []
-        if isinstance(rel, list):
-            rel_str = " ".join(rel)
+        rel_attr = link.get("rel") or []
+        if isinstance(rel_attr, list):
+            rel_str = " ".join(rel_attr)
         else:
-            rel_str = str(rel)
+            rel_str = str(rel_attr)
         if "stylesheet" not in rel_str:
             continue
 
         href = link.get("href")
-        if not href:
-            continue
-        if not (href.startswith("/") or href.startswith("//")):
+        if not href or not (href.startswith("/") or href.startswith("//")):
             continue
 
         css_rel = download_asset(
@@ -545,14 +610,27 @@ def process_html(
             categories.append(text)
     categories_str = "|".join(categories)
 
+    # 6. Pull last-modified out of the footer while we still have the tree.
+    footer = soup.select_one("#footer-info-lastmod")
+    if footer:
+        last_modified = footer.get_text(strip=True) or time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        )
+    else:
+        last_modified = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
     processed = str(soup)
-    return processed, categories_str
+    return processed, categories_str, last_modified
 
 
+# Kept for backward compat with any external caller / earlier scripts.
 def extract_last_modified(html: str) -> str:
     """
     Try to pull the 'Última modificação' timestamp out of the footer. Falls
     back to the current UTC timestamp if we can't find it.
+
+    Prefer using the value returned from `process_html` — this re-parses the
+    HTML and is only useful if you have raw HTML with no soup already built.
     """
     soup = BeautifulSoup(html, "lxml")
     footer = soup.select_one("#footer-info-lastmod")
@@ -571,15 +649,21 @@ def extract_last_modified(html: str) -> str:
 def open_db(data_dir: Path) -> sqlite3.Connection:
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = data_dir / "stardewvalleydex.sqlite"
-    conn = sqlite3.connect(db_path)
+    # check_same_thread=False so the writer thread pattern (fetch on workers,
+    # write on the main thread) doesn't require a separate connection.
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    # WAL + normal sync gives us a large write-throughput boost with negligible
+    # risk for a dev dump script.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
     conn.executescript(SCHEMA_SQL)
     conn.commit()
     return conn
 
 
 def existing_titles(conn: sqlite3.Connection) -> set[str]:
-    cur = conn.execute("SELECT title FROM pages")
-    return {row[0] for row in cur.fetchall()}
+    return {row[0] for row in conn.execute("SELECT title FROM pages")}
 
 
 def upsert_redirect(conn: sqlite3.Connection, from_title: str, to_title: str) -> None:
@@ -595,8 +679,7 @@ def upsert_redirect(conn: sqlite3.Connection, from_title: str, to_title: str) ->
 
 
 def existing_redirects(conn: sqlite3.Connection) -> set[str]:
-    cur = conn.execute("SELECT from_title FROM redirects")
-    return {row[0] for row in cur.fetchall()}
+    return {row[0] for row in conn.execute("SELECT from_title FROM redirects")}
 
 
 def upsert_page(
@@ -649,27 +732,28 @@ def find_missing_targets(conn: sqlite3.Connection) -> set[str]:
     Considers common title-form variants (underscores vs spaces, stripped
     quotes) when deciding whether a link is already covered.
     """
+    # Single pass over pages: build the `known` set and collect candidates at
+    # the same time. Avoids two full table scans and holding all HTML twice.
     known: set[str] = set()
-    for (t,) in conn.execute("SELECT title FROM pages"):
-        known.add(t)
-        known.add(t.replace("_", " "))
-        known.add(t.replace(" ", "_"))
-        clean = t.strip('"').strip("'")
+    candidates: set[str] = set()
+    skip_prefixes = tuple(ns + ":" for ns in SKIP_NS)
+
+    for (title, html) in conn.execute("SELECT title, html FROM pages"):
+        known.add(title)
+        known.add(title.replace("_", " "))
+        known.add(title.replace(" ", "_"))
+        clean = title.strip('"').strip("'")
         known.add(clean)
         known.add(clean.replace("_", " "))
 
-    missing: set[str] = set()
-    for (html,) in conn.execute("SELECT html FROM pages"):
         for m in _HREF_RE.finditer(html):
             raw = unquote(m.group(1)).strip()
             target = raw.replace("_", " ").strip('"').strip("'")
-            if not target:
+            if not target or target.startswith(skip_prefixes):
                 continue
-            if any(target.startswith(ns + ":") for ns in SKIP_NS):
-                continue
-            if target not in known:
-                missing.add(target)
-    return missing
+            candidates.add(target)
+
+    return {t for t in candidates if t not in known}
 
 
 def fix_quoted_links(conn: sqlite3.Connection) -> int:
@@ -681,6 +765,9 @@ def fix_quoted_links(conn: sqlite3.Connection) -> int:
     count = 0
     updates: list[tuple[str, str]] = []
     for title, html in conn.execute("SELECT title, html FROM pages"):
+        if "%22" not in html:  # fast prefilter
+            continue
+
         def replacer(m: re.Match) -> str:
             nonlocal count
             inner = unquote(m.group(1)).strip('"').strip("'")
@@ -704,6 +791,7 @@ def crawl_missing_pass(
     asset_counter: list[int],
     max_pages: int,
     verbose_assets: bool = False,
+    workers: int = DEFAULT_WORKERS,
 ) -> int:
     """
     Repeatedly scan the DB for missing internal link targets and download them
@@ -727,43 +815,145 @@ def crawl_missing_pass(
             print("\nNo more missing pages. Closure pass done.")
             break
 
-        print(f"\nRound {round_num}: {len(missing)} missing pages to download...")
-        added_this_round = 0
+        remaining = max_pages - total_added
+        ordered = sorted(missing)[:remaining]
+        print(f"\nRound {round_num}: {len(missing)} missing pages "
+              f"(downloading up to {len(ordered)} with {workers} workers)...")
 
-        for i, title in enumerate(sorted(missing), 1):
-            if total_added >= max_pages:
-                break
-
-            print(f"  [{i}/{len(missing)}] {title!r} ...", end=" ", flush=True)
-
-            html, status, source = fetch_page_html(session, title)
-            if html is not None:
-                processed, categories = process_html(
-                    session, html, assets_dir, asset_counter,
-                    verbose_assets=verbose_assets,
-                )
-                last_modified = extract_last_modified(html)
-                upsert_page(conn, title, processed, last_modified, categories)
-                total_added += 1
-                added_this_round += 1
-                label = f"ok (EN: {source[3:]})" if source.startswith("en:") else f"ok ({source})"
-                print(label)
-            else:
-                # Neither PT nor EN had it — persist an offline stub so we
-                # don't keep re-scanning this title on future rounds.
-                ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                upsert_page(conn, title, _stub_html(title), ts, "")
-                added_this_round += 1
-                print(f"stub (HTTP {status})")
-
-            time.sleep(PAGE_SLEEP)
-
+        added_this_round = _process_titles_concurrent(
+            session=session,
+            conn=conn,
+            titles=ordered,
+            assets_dir=assets_dir,
+            asset_counter=asset_counter,
+            verbose_assets=verbose_assets,
+            workers=workers,
+            allow_stub_on_miss=True,
+        )
+        total_added += added_this_round
         print(f"  Round {round_num} done: {added_this_round} pages processed.")
         if added_this_round == 0:
             break
 
     print(f"\nCrawl-missing total pages added: {total_added}")
     return total_added
+
+
+# ---------------------------------------------------------------------------
+# Concurrent page pipeline
+# ---------------------------------------------------------------------------
+
+
+def _fetch_task(
+    session: requests.Session, title: str
+) -> tuple[str, Optional[str], int, str]:
+    """Worker fn: fetch one page's raw HTML. Sleeps briefly to be polite."""
+    html, status, source = fetch_page_html(session, title)
+    if PAGE_SLEEP:
+        time.sleep(PAGE_SLEEP)
+    return title, html, status, source
+
+
+def _process_titles_concurrent(
+    session: requests.Session,
+    conn: sqlite3.Connection,
+    titles: list[str],
+    assets_dir: Path,
+    asset_counter: list[int],
+    verbose_assets: bool,
+    workers: int,
+    allow_stub_on_miss: bool,
+    already_done: Optional[set[str]] = None,
+    already_redirected: Optional[set[str]] = None,
+) -> int:
+    """
+    Fetch a list of titles concurrently, then serially process the HTML and
+    persist to SQLite. Network I/O (the actual bottleneck) is parallelized;
+    HTML parsing and DB writes stay on the main thread to keep BeautifulSoup
+    and SQLite happy without extra locking.
+
+    Returns the number of pages successfully written (including redirects
+    and stubs, matching the previous behavior of `ok_count`/`added_this_round`).
+    """
+    if not titles:
+        return 0
+
+    already_done = already_done or set()
+    already_redirected = already_redirected or set()
+
+    total = len(titles)
+    written = 0
+    fail = 0
+    skip = 0
+    completed = 0
+
+    # Submit all fetches to the pool up front. Results are consumed in
+    # completion order so slow requests don't block faster ones.
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="fetch") as pool:
+        futures = {}
+        for title in titles:
+            if title in already_done or title in already_redirected:
+                skip += 1
+                completed += 1
+                print(f"[{completed}/{total}] {title} ... (skip: already in DB)")
+                continue
+            futures[pool.submit(_fetch_task, session, title)] = title
+
+        for fut in as_completed(futures):
+            completed += 1
+            title = futures[fut]
+            try:
+                _t, html, status, source = fut.result()
+            except Exception as e:  # noqa: BLE001 - dump script, keep going
+                fail += 1
+                print(f"[{completed}/{total}] {title} ... x ({type(e).__name__}: {e})")
+                continue
+
+            prefix = f"[{completed}/{total}] {title} ..."
+
+            if html is None:
+                if status == 404:
+                    target = fetch_redirect_target(session, title)
+                    if target:
+                        upsert_redirect(conn, title, target)
+                        written += 1
+                        print(f"{prefix} ok (redirect → {target})")
+                        continue
+                if allow_stub_on_miss:
+                    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    upsert_page(conn, title, _stub_html(title), ts, "")
+                    written += 1
+                    print(f"{prefix} stub (HTTP {status})")
+                else:
+                    fail += 1
+                    print(f"{prefix} x (HTTP {status})")
+                continue
+
+            try:
+                processed, categories, last_modified = process_html(
+                    session, html, assets_dir, asset_counter,
+                    verbose_assets=verbose_assets,
+                )
+                # Free the raw HTML ref early — pages can be a few hundred KB.
+                html = None  # noqa: F841
+                upsert_page(conn, title, processed, last_modified, categories)
+            except Exception as e:  # noqa: BLE001
+                fail += 1
+                print(f"{prefix} x ({type(e).__name__}: {e})")
+                continue
+
+            written += 1
+            label = f"ok (EN: {source[3:]})" if source.startswith("en:") else "ok"
+            print(f"{prefix} {label}")
+
+    # For the main-dump caller we want a breakdown; pack extras into globals
+    # via attributes on the function so the caller can read them without
+    # changing the return signature (kept for compatibility with the old
+    # crawl_missing_pass contract).
+    _process_titles_concurrent.last_ok = written  # type: ignore[attr-defined]
+    _process_titles_concurrent.last_fail = fail  # type: ignore[attr-defined]
+    _process_titles_concurrent.last_skip = skip  # type: ignore[attr-defined]
+    return written
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +1010,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=5000,
         help="Cap on pages added during the --crawl-missing pass (default: 5000).",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"Number of concurrent HTTP fetch workers (default: {DEFAULT_WORKERS}).",
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -837,7 +1033,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         print("WARNING: SSL verification disabled.")
-    session = make_session(verify_ssl=not args.no_ssl_verify)
+
+    workers = max(1, args.workers)
+    # Give the connection pool enough capacity for the workers plus asset
+    # downloads that they trigger.
+    session = make_session(
+        verify_ssl=not args.no_ssl_verify,
+        pool_size=max(32, workers * 4),
+    )
     conn = open_db(data_dir)
 
     asset_counter = [0]
@@ -857,50 +1060,21 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             titles = titles[: args.limit]
             print(f"--limit set: processing first {len(titles)} title(s) only.")
 
-        total = len(titles)
         start_ts = time.time()
-
-        for idx, title in enumerate(titles, start=1):
-            if title in already_done or title in already_redirected:
-                skip_count += 1
-                print(f"[{idx}/{total}] {title} ... (skip: already in DB)")
-                continue
-
-            print(f"[{idx}/{total}] {title} ...", end=" ", flush=True)
-            try:
-                html, status, source = fetch_page_html(session, title)
-                if html is None:
-                    if status == 404:
-                        # Check if the PT wiki knows this as a redirect page
-                        target = fetch_redirect_target(session, title)
-                        if target:
-                            upsert_redirect(conn, title, target)
-                            ok_count += 1
-                            print(f"ok (redirect → {target})")
-                            time.sleep(PAGE_SLEEP)
-                            continue
-                    print(f"x (HTTP {status})")
-                    fail_count += 1
-                    time.sleep(PAGE_SLEEP)
-                    continue
-
-                processed, categories = process_html(
-                    session,
-                    html,
-                    assets_dir,
-                    asset_counter,
-                    verbose_assets=args.verbose_assets,
-                )
-                last_modified = extract_last_modified(html)
-                upsert_page(conn, title, processed, last_modified, categories)
-                ok_count += 1
-                label = f"ok (EN: {source[3:]})" if source.startswith("en:") else "ok"
-                print(label)
-            except Exception as e:  # noqa: BLE001 - dump script, keep going
-                fail_count += 1
-                print(f"x ({type(e).__name__}: {e})")
-
-            time.sleep(PAGE_SLEEP)
+        ok_count = _process_titles_concurrent(
+            session=session,
+            conn=conn,
+            titles=titles,
+            assets_dir=assets_dir,
+            asset_counter=asset_counter,
+            verbose_assets=args.verbose_assets,
+            workers=workers,
+            allow_stub_on_miss=False,
+            already_done=already_done,
+            already_redirected=already_redirected,
+        )
+        fail_count = getattr(_process_titles_concurrent, "last_fail", 0)
+        skip_count = getattr(_process_titles_concurrent, "last_skip", 0)
 
         elapsed = time.time() - start_ts
         print()
@@ -925,6 +1099,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             asset_counter,
             max_pages=args.max_pages,
             verbose_assets=args.verbose_assets,
+            workers=workers,
         )
         print(f"  crawl-missing added: {crawl_added}")
         print(f"  total assets downloaded: {asset_counter[0]}")
