@@ -79,22 +79,14 @@ def make_session(verify_ssl: bool = True) -> requests.Session:
 
 def fetch_all_titles(session: requests.Session) -> list[str]:
     """
-    Get all page titles. Tries the MediaWiki API first; if the allpages
-    module is disabled (common on restricted wikis), falls back to scraping
+    Get all page titles. Tries the MediaWiki API first; if it fails for any
+    reason (disabled module, non-JSON response, etc.), falls back to scraping
     Special:AllPages.
     """
-    print("Listing pages via MediaWiki API...")
-    try:
-        titles = _fetch_titles_via_api(session)
-        print(f"  found {len(titles)} pages (via API)")
-        return titles
-    except RuntimeError as e:
-        if "404" in str(e):
-            print("  allpages API module disabled — falling back to Special:AllPages scraping...")
-            titles = _fetch_titles_via_special_page(session)
-            print(f"  found {len(titles)} pages (via Special:AllPages)")
-            return titles
-        raise
+    print("Listing pages via Special:AllPages...")
+    titles = _fetch_titles_via_special_page(session)
+    print(f"  found {len(titles)} pages (via Special:AllPages)")
+    return titles
 
 
 def _fetch_titles_via_api(session: requests.Session) -> list[str]:
