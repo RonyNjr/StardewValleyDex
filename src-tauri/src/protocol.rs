@@ -39,6 +39,15 @@ fn handle_request<R: Runtime>(
     // Assets: files with a recognised extension are served from disk.
     if let Some(ext) = extension_of(&target) {
         if is_asset_extension(&ext) {
+            if target == "stardewbackground.png" {
+                static BG: &[u8] = include_bytes!("../stardewbackground.png");
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "image/png")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(BG.to_vec())
+                    .unwrap_or_else(|_| internal_error("Failed to build response"));
+            }
             return serve_asset(assets_dir, &target, &ext);
         }
     }
@@ -64,7 +73,13 @@ fn handle_request<R: Runtime>(
     }
 }
 
-const HEADER_HTML: &str = r#"<style>html,body{background-color:#a7c4d4!important}</style>
+const HEADER_HTML: &str = r#"<style>
+html{background-image:url('wiki://localhost/stardewbackground.png')!important;background-size:cover!important;background-attachment:fixed!important;background-position:center!important;background-color:#a7c4d4!important}body{background:transparent!important}
+#svd-q::placeholder{color:rgba(255,255,255,0.5)}
+#svd-q:focus{outline:none;background:rgba(255,255,255,0.2)!important;border-color:rgba(255,255,255,0.45)!important}
+#svd-back:hover{background:rgba(255,255,255,0.2)!important}
+#svd-go:hover{opacity:.9}
+</style>
 <script>
 document.addEventListener('click',function(e){
   var a=e.target.closest('a');
@@ -76,11 +91,12 @@ document.addEventListener('click',function(e){
   }
 },true);
 </script>
-<div id="svd-header" style="display:flex;align-items:center;gap:16px;padding:10px 20px;background:#2d5a1b;color:#fff;position:sticky;top:0;z-index:9999;font-family:sans-serif">
-  <span style="font-weight:bold;font-size:1.1rem;cursor:pointer;white-space:nowrap" onclick="window.location='wiki://localhost/'">StardewValleyDex</span>
-  <form style="display:flex;flex:1;gap:8px;max-width:700px" onsubmit="event.preventDefault();var t=document.getElementById('svd-q').value.trim().replace(/\s+/g,'_');if(t)window.location='wiki://localhost/'+encodeURIComponent(t)">
-    <input id="svd-q" type="text" placeholder="Título da página (ex: Mining)" style="flex:1;padding:6px 12px;border:none;border-radius:4px;font-size:.95rem"/>
-    <button type="submit" style="padding:6px 16px;background:#5a3a1a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:.95rem">Ir</button>
+<div id="svd-header" style="display:flex;align-items:center;gap:14px;padding:10px 18px;margin:12px auto 0;max-width:960px;width:calc(100% - 32px);background:rgba(30,60,15,0.5);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);color:#fff;position:sticky;top:12px;z-index:9999;border-radius:22px;border:1px solid rgba(255,255,255,0.18);box-shadow:0 4px 32px rgba(0,0,0,0.2),inset 0 1px 0 rgba(255,255,255,0.18);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+  <button id="svd-back" onclick="history.back()" style="display:flex;align-items:center;gap:6px;background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.18);color:#fff;border-radius:50px;padding:6px 14px;cursor:pointer;font-size:.82rem;font-family:inherit;white-space:nowrap">← Voltar</button>
+  <span style="font-weight:700;font-size:.95rem;cursor:pointer;white-space:nowrap;letter-spacing:-.3px" onclick="window.location='wiki://localhost/'">🌾 StardewValleyDex</span>
+  <form style="display:flex;flex:1;gap:8px;max-width:580px" onsubmit="event.preventDefault();var t=document.getElementById('svd-q').value.trim().replace(/\s+/g,'_');if(t)window.location='wiki://localhost/'+encodeURIComponent(t)">
+    <input id="svd-q" type="text" placeholder="Buscar página..." style="flex:1;padding:8px 16px;border:1px solid rgba(255,255,255,0.18);border-radius:50px;font-size:.88rem;background:rgba(255,255,255,0.13);color:#fff;font-family:inherit"/>
+    <button id="svd-go" type="submit" style="padding:8px 20px;background:rgba(240,178,38,.9);color:#1a1a1a;border:none;border-radius:50px;cursor:pointer;font-size:.88rem;font-weight:600;font-family:inherit;white-space:nowrap">Buscar</button>
   </form>
 </div>"#;
 

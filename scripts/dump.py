@@ -8,10 +8,16 @@ assets (images + CSS) to disk, and stores the processed HTML in the SQLite
 database consumed by the Tauri app.
 
 Usage:
-    python3 scripts/dump.py                   # full dump
-    python3 scripts/dump.py --limit 5         # only 5 pages (for testing)
-    python3 scripts/dump.py --resume          # skip pages already in SQLite
-    python3 scripts/dump.py --data-dir ./tmp  # override data directory
+    python3 scripts/dump.py                        # full dump
+    python3 scripts/dump.py --limit 5              # only 5 pages (for testing)
+    python3 scripts/dump.py --resume               # skip pages already in SQLite
+    python3 scripts/dump.py --data-dir ./tmp       # override data directory
+
+    # Link-graph closure pass: after the main dump, scan stored HTML for
+    # wiki://localhost/ links that point at pages not yet in the DB, and
+    # download them in rounds until fixpoint (or --max-pages reached):
+    python3 scripts/dump.py --resume --crawl-missing
+    python3 scripts/dump.py --crawl-missing-only   # skip the main dump entirely
 
 Requirements: see scripts/requirements.txt
 """
@@ -20,13 +26,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import os
+import re
 import sqlite3
 import sys
 import time
 from pathlib import Path
 from typing import Iterable, Optional
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import quote, urljoin, urlparse, unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -43,6 +49,13 @@ API_SLEEP = 0.1
 
 # Elements to strip out of the wiki HTML entirely (original MediaWiki chrome).
 STRIP_SELECTORS = ["#mw-head", "#mw-head-base", "#mw-page-base"]
+
+# MediaWiki namespaces we never want to crawl / follow as internal links.
+SKIP_NS = (
+    "Especial", "Special", "Ficheiro", "File", "Ajuda", "Help",
+    "Predefinição", "Template", "Categoria", "Category",
+    "Módulo", "Module", "MediaWiki", "Usuário", "User", "Discussão",
+)
 
 DEFAULT_DATA_DIR = (
     Path.home()
@@ -162,11 +175,6 @@ def _fetch_titles_via_sitemap(session: requests.Session) -> list[str]:
 
 
 def _extract_title_from_url(url: str, titles: list) -> None:
-    SKIP_NS = (
-        "Especial", "Special", "Ficheiro", "File", "Ajuda", "Help",
-        "Predefinição", "Template", "Categoria", "Category",
-        "Módulo", "Module", "MediaWiki", "Usuário", "User", "Discussão",
-    )
     for prefix in [f"{WIKI_BASE}/wiki/", f"{WIKI_BASE}/"]:
         if url.startswith(prefix):
             raw = url[len(prefix):].split("#")[0].split("?")[0]
@@ -201,12 +209,6 @@ def _fetch_titles_via_special_page(session: requests.Session) -> list[str]:
 
     if not start_url:
         raise RuntimeError("Could not reach Special:AllPages or sitemap on this wiki.")
-
-    SKIP_NS = (
-        "Especial", "Special", "Ficheiro", "File", "Ajuda", "Help",
-        "Predefinição", "Template", "Categoria", "Category",
-        "Módulo", "Module", "MediaWiki", "Usuário", "User", "Discussão",
-    )
 
     titles = []
     url: Optional[str] = start_url
@@ -319,10 +321,12 @@ def _fetch_en_title(session: requests.Session, pt_title: str) -> Optional[str]:
 
 
 def _fetch_html(session: requests.Session, title: str, base: str) -> tuple[Optional[str], int]:
-    from urllib.parse import quote
     slug = quote(title.replace(" ", "_"), safe="/:@!$&'()*+,;=.-_~")
     url = f"{base}/{slug}"
-    resp = session.get(url, timeout=30)
+    try:
+        resp = session.get(url, timeout=30)
+    except requests.RequestException:
+        return None, 0
     if resp.status_code != 200:
         return None, resp.status_code
     return resp.text, 200
@@ -331,7 +335,8 @@ def _fetch_html(session: requests.Session, title: str, base: str) -> tuple[Optio
 def fetch_page_html(session: requests.Session, title: str) -> tuple[Optional[str], int, str]:
     """
     Fetch a wiki page. Tries PT wiki first; on 404 falls back to the EN wiki
-    via langlinks. Returns (html, status_code, source) where source is 'pt' or 'en'.
+    via langlinks. Returns (html, status_code, source) where source is 'pt' or
+    'en:<en_title>'.
     """
     html, status = _fetch_html(session, title, WIKI_BASE)
     if html is not None:
@@ -616,6 +621,152 @@ def upsert_page(
 
 
 # ---------------------------------------------------------------------------
+# Link-graph closure pass (formerly crawl_missing.py)
+# ---------------------------------------------------------------------------
+
+
+_HREF_RE = re.compile(r'href="wiki://localhost/([^"#?]*)"', re.IGNORECASE)
+_QUOTED_HREF_RE = re.compile(r'href="wiki://localhost/(%22[^"]*%22)"', re.IGNORECASE)
+
+
+def _stub_html(title: str) -> str:
+    """HTML stub written for pages that are missing from both PT and EN wikis."""
+    en_url = f"https://stardewvalleywiki.com/{quote(title.replace(' ', '_'))}"
+    return (
+        f'<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">'
+        f'<title>{title}</title></head>'
+        f'<body><h1>{title}</h1>'
+        f'<p>Esta página não está disponível offline.</p>'
+        f'<p><a href="{en_url}">Ver no wiki em inglês</a></p>'
+        f'</body></html>'
+    )
+
+
+def find_missing_targets(conn: sqlite3.Connection) -> set[str]:
+    """
+    Scan all stored pages for `href="wiki://localhost/..."` links and return
+    the set of target titles that are not present in the pages table.
+    Considers common title-form variants (underscores vs spaces, stripped
+    quotes) when deciding whether a link is already covered.
+    """
+    known: set[str] = set()
+    for (t,) in conn.execute("SELECT title FROM pages"):
+        known.add(t)
+        known.add(t.replace("_", " "))
+        known.add(t.replace(" ", "_"))
+        clean = t.strip('"').strip("'")
+        known.add(clean)
+        known.add(clean.replace("_", " "))
+
+    missing: set[str] = set()
+    for (html,) in conn.execute("SELECT html FROM pages"):
+        for m in _HREF_RE.finditer(html):
+            raw = unquote(m.group(1)).strip()
+            target = raw.replace("_", " ").strip('"').strip("'")
+            if not target:
+                continue
+            if any(target.startswith(ns + ":") for ns in SKIP_NS):
+                continue
+            if target not in known:
+                missing.add(target)
+    return missing
+
+
+def fix_quoted_links(conn: sqlite3.Connection) -> int:
+    """
+    Rewrite `wiki://localhost/%22Title%22` (quoted) hrefs in stored HTML to
+    `wiki://localhost/Title`. One-time cleanup for pages persisted before the
+    quote-stripping fix landed. Returns the number of hrefs rewritten.
+    """
+    count = 0
+    updates: list[tuple[str, str]] = []
+    for title, html in conn.execute("SELECT title, html FROM pages"):
+        def replacer(m: re.Match) -> str:
+            nonlocal count
+            inner = unquote(m.group(1)).strip('"').strip("'")
+            encoded = quote(inner.replace(" ", "_"), safe="/:@!$&'()*+,;=.-_~")
+            count += 1
+            return f'href="wiki://localhost/{encoded}"'
+
+        new_html = _QUOTED_HREF_RE.sub(replacer, html)
+        if new_html != html:
+            updates.append((new_html, title))
+    if updates:
+        conn.executemany("UPDATE pages SET html = ? WHERE title = ?", updates)
+        conn.commit()
+    return count
+
+
+def crawl_missing_pass(
+    session: requests.Session,
+    conn: sqlite3.Connection,
+    assets_dir: Path,
+    asset_counter: list[int],
+    max_pages: int,
+    verbose_assets: bool = False,
+) -> int:
+    """
+    Repeatedly scan the DB for missing internal link targets and download them
+    until fixpoint (or `max_pages` new pages have been added). Missing pages
+    that 404 on both PT and EN wikis are recorded as offline stubs so we
+    don't keep retrying them.
+
+    Returns the total number of pages added (real + stubs).
+    """
+    fixed = fix_quoted_links(conn)
+    if fixed:
+        print(f"Fixed {fixed} quoted links in stored HTML.")
+
+    round_num = 0
+    total_added = 0
+
+    while total_added < max_pages:
+        round_num += 1
+        missing = find_missing_targets(conn)
+        if not missing:
+            print("\nNo more missing pages. Closure pass done.")
+            break
+
+        print(f"\nRound {round_num}: {len(missing)} missing pages to download...")
+        added_this_round = 0
+
+        for i, title in enumerate(sorted(missing), 1):
+            if total_added >= max_pages:
+                break
+
+            print(f"  [{i}/{len(missing)}] {title!r} ...", end=" ", flush=True)
+
+            html, status, source = fetch_page_html(session, title)
+            if html is not None:
+                processed, categories = process_html(
+                    session, html, assets_dir, asset_counter,
+                    verbose_assets=verbose_assets,
+                )
+                last_modified = extract_last_modified(html)
+                upsert_page(conn, title, processed, last_modified, categories)
+                total_added += 1
+                added_this_round += 1
+                label = f"ok (EN: {source[3:]})" if source.startswith("en:") else f"ok ({source})"
+                print(label)
+            else:
+                # Neither PT nor EN had it — persist an offline stub so we
+                # don't keep re-scanning this title on future rounds.
+                ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                upsert_page(conn, title, _stub_html(title), ts, "")
+                added_this_round += 1
+                print(f"stub (HTTP {status})")
+
+            time.sleep(PAGE_SLEEP)
+
+        print(f"  Round {round_num} done: {added_this_round} pages processed.")
+        if added_this_round == 0:
+            break
+
+    print(f"\nCrawl-missing total pages added: {total_added}")
+    return total_added
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -649,6 +800,26 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Disable SSL certificate verification (workaround for LibreSSL on macOS).",
     )
+    parser.add_argument(
+        "--crawl-missing",
+        action="store_true",
+        help=(
+            "After the main dump completes, scan stored HTML for wiki://localhost "
+            "links pointing at pages not yet in the DB and download them in rounds "
+            "until fixpoint (or --max-pages)."
+        ),
+    )
+    parser.add_argument(
+        "--crawl-missing-only",
+        action="store_true",
+        help="Skip the main dump entirely and only run the link-graph closure pass.",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=5000,
+        help="Cap on pages added during the --crawl-missing pass (default: 5000).",
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -669,75 +840,94 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     session = make_session(verify_ssl=not args.no_ssl_verify)
     conn = open_db(data_dir)
 
-    already_done: set[str] = existing_titles(conn) if args.resume else set()
-    already_redirected: set[str] = existing_redirects(conn) if args.resume else set()
-    if args.resume:
-        print(f"Resume mode: {len(already_done)} pages already in DB will be skipped.")
-
-    titles = fetch_all_titles(session)
-    if args.limit is not None:
-        titles = titles[: args.limit]
-        print(f"--limit set: processing first {len(titles)} title(s) only.")
-
-    total = len(titles)
     asset_counter = [0]
     ok_count = 0
     fail_count = 0
     skip_count = 0
-    start_ts = time.time()
+    run_main_dump = not args.crawl_missing_only
 
-    for idx, title in enumerate(titles, start=1):
-        if title in already_done or title in already_redirected:
-            skip_count += 1
-            print(f"[{idx}/{total}] {title} ... (skip: already in DB)")
-            continue
+    if run_main_dump:
+        already_done: set[str] = existing_titles(conn) if args.resume else set()
+        already_redirected: set[str] = existing_redirects(conn) if args.resume else set()
+        if args.resume:
+            print(f"Resume mode: {len(already_done)} pages already in DB will be skipped.")
 
-        print(f"[{idx}/{total}] {title} ...", end=" ", flush=True)
-        try:
-            html, status, source = fetch_page_html(session, title)
-            if html is None:
-                if status == 404:
-                    # Check if the PT wiki knows this as a redirect page
-                    target = fetch_redirect_target(session, title)
-                    if target:
-                        upsert_redirect(conn, title, target)
-                        ok_count += 1
-                        print(f"ok (redirect → {target})")
-                        time.sleep(PAGE_SLEEP)
-                        continue
-                print(f"x (HTTP {status})")
-                fail_count += 1
-                time.sleep(PAGE_SLEEP)
+        titles = fetch_all_titles(session)
+        if args.limit is not None:
+            titles = titles[: args.limit]
+            print(f"--limit set: processing first {len(titles)} title(s) only.")
+
+        total = len(titles)
+        start_ts = time.time()
+
+        for idx, title in enumerate(titles, start=1):
+            if title in already_done or title in already_redirected:
+                skip_count += 1
+                print(f"[{idx}/{total}] {title} ... (skip: already in DB)")
                 continue
 
-            processed, categories = process_html(
-                session,
-                html,
-                assets_dir,
-                asset_counter,
-                verbose_assets=args.verbose_assets,
-            )
-            last_modified = extract_last_modified(html)
-            upsert_page(conn, title, processed, last_modified, categories)
-            ok_count += 1
-            label = f"ok (EN: {source[3:]})" if source.startswith("en:") else "ok"
-            print(label)
-        except Exception as e:  # noqa: BLE001 - dump script, keep going
-            fail_count += 1
-            print(f"x ({type(e).__name__}: {e})")
+            print(f"[{idx}/{total}] {title} ...", end=" ", flush=True)
+            try:
+                html, status, source = fetch_page_html(session, title)
+                if html is None:
+                    if status == 404:
+                        # Check if the PT wiki knows this as a redirect page
+                        target = fetch_redirect_target(session, title)
+                        if target:
+                            upsert_redirect(conn, title, target)
+                            ok_count += 1
+                            print(f"ok (redirect → {target})")
+                            time.sleep(PAGE_SLEEP)
+                            continue
+                    print(f"x (HTTP {status})")
+                    fail_count += 1
+                    time.sleep(PAGE_SLEEP)
+                    continue
 
-        time.sleep(PAGE_SLEEP)
+                processed, categories = process_html(
+                    session,
+                    html,
+                    assets_dir,
+                    asset_counter,
+                    verbose_assets=args.verbose_assets,
+                )
+                last_modified = extract_last_modified(html)
+                upsert_page(conn, title, processed, last_modified, categories)
+                ok_count += 1
+                label = f"ok (EN: {source[3:]})" if source.startswith("en:") else "ok"
+                print(label)
+            except Exception as e:  # noqa: BLE001 - dump script, keep going
+                fail_count += 1
+                print(f"x ({type(e).__name__}: {e})")
 
-    elapsed = time.time() - start_ts
-    print()
-    print("=" * 60)
-    print(f"Done in {elapsed:.1f}s")
-    print(f"  pages ok:      {ok_count}")
-    print(f"  pages failed:  {fail_count}")
-    print(f"  pages skipped: {skip_count}")
-    print(f"  assets downloaded: {asset_counter[0]}")
-    print(f"  db: {data_dir / 'stardewvalleydex.sqlite'}")
-    print(f"  assets: {assets_dir}")
+            time.sleep(PAGE_SLEEP)
+
+        elapsed = time.time() - start_ts
+        print()
+        print("=" * 60)
+        print(f"Main dump done in {elapsed:.1f}s")
+        print(f"  pages ok:      {ok_count}")
+        print(f"  pages failed:  {fail_count}")
+        print(f"  pages skipped: {skip_count}")
+        print(f"  assets downloaded: {asset_counter[0]}")
+        print(f"  db: {data_dir / 'stardewvalleydex.sqlite'}")
+        print(f"  assets: {assets_dir}")
+
+    crawl_added = 0
+    if args.crawl_missing or args.crawl_missing_only:
+        print()
+        print("=" * 60)
+        print("Starting link-graph closure pass (--crawl-missing)...")
+        crawl_added = crawl_missing_pass(
+            session,
+            conn,
+            assets_dir,
+            asset_counter,
+            max_pages=args.max_pages,
+            verbose_assets=args.verbose_assets,
+        )
+        print(f"  crawl-missing added: {crawl_added}")
+        print(f"  total assets downloaded: {asset_counter[0]}")
 
     conn.close()
     return 0 if fail_count == 0 else 1
