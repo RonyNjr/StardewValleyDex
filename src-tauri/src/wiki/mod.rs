@@ -44,8 +44,13 @@ pub const SKIP_NS: &[&str] = &[
     "Module",
     "MediaWiki",
     "Usuário",
+    "Usuária",
+    "Utilizador",
+    "Utilizadora",
     "User",
     "Discussão",
+    "Talk",
+    "Stardew Valley Wiki",
 ];
 
 /// Characters left unescaped in page URLs (same set as the old Python
@@ -87,11 +92,11 @@ pub fn title_key(title: &str) -> String {
 }
 
 pub fn is_skipped_namespace(title: &str) -> bool {
-    SKIP_NS.iter().any(|ns| {
-        title
-            .strip_prefix(ns)
-            .is_some_and(|rest| rest.starts_with(':'))
-    })
+    let Some((ns, _)) = title.split_once(':') else {
+        return false;
+    };
+    // Talk namespaces ("User talk", "Utilizador Discussão", ...) are never content.
+    SKIP_NS.contains(&ns) || ns.ends_with(" talk") || ns.ends_with(" Discussão")
 }
 
 pub fn now_unix() -> i64 {
@@ -155,6 +160,13 @@ mod tests {
     fn skipped_namespaces() {
         assert!(is_skipped_namespace("Ficheiro:Foo.png"));
         assert!(is_skipped_namespace("Categoria:Peixes"));
+        assert!(is_skipped_namespace("Talk:Mining"));
+        assert!(is_skipped_namespace("User talk:Alguém"));
+        assert!(is_skipped_namespace("Modding talk:Index"));
+        assert!(is_skipped_namespace("Utilizadora Discussão:Alguém"));
+        assert!(is_skipped_namespace("Stardew Valley Wiki:Sobre"));
+        assert!(!is_skipped_namespace("Modding:Index"));
+        assert!(!is_skipped_namespace("Warp Totem: Beach"));
         assert!(!is_skipped_namespace("Filetes"));
         assert!(!is_skipped_namespace("Mineração"));
     }

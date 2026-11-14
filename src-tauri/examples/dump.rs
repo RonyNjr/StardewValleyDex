@@ -14,7 +14,7 @@
 //!
 //! Run with `--help` for the options.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -25,7 +25,8 @@ use futures_util::{stream, StreamExt};
 use rusqlite::Connection;
 use tauri_app_lib::db::{self, SyncCursor};
 use tauri_app_lib::wiki::{
-    crawl, html, title_key, utc_now, Error, PageOutcome, PageSource, WikiClient, WikiConfig,
+    crawl, html, percent_decode, title_key, utc_now, Error, PageOutcome, PageSource, WikiClient,
+    WikiConfig,
 };
 
 /// Must match `identifier` in tauri.conf.json: the app reads its data from
@@ -320,16 +321,17 @@ async fn run(args: Args) -> Result<bool, Error> {
     }
 
     if let Some(zip_path) = &args.zip {
+        let assets = referenced_assets(&conn, &args.data_dir.join("assets"))?;
         // Fold the WAL back in so the packed database is one self-contained file.
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE; VACUUM;")?;
         drop(conn);
         println!();
         println!("Writing {} ...", zip_path.display());
-        let files = write_release_zip(&args.data_dir, zip_path)?;
+        write_release_zip(&args.data_dir, &assets, zip_path)?;
         let size = std::fs::metadata(zip_path)?.len();
         println!(
             "  {} assets + database, {:.1} MB",
-            files,
+            assets.len(),
             size as f64 / 1_000_000.0
         );
     }
@@ -337,9 +339,36 @@ async fn run(args: Args) -> Result<bool, Error> {
     Ok(failed == 0)
 }
 
-/// Pack the database and assets the way the app's `download_and_setup`
+/// Asset files (paths relative to `assets_dir`) that some stored page
+/// points at. Files no page uses, such as leftovers from earlier runs or
+/// half-written downloads, stay out of the release zip.
+fn referenced_assets(conn: &Connection, assets_dir: &Path) -> Result<Vec<String>, Error> {
+    const PREFIX: &str = "wiki://localhost/";
+    let mut found = BTreeSet::new();
+    let mut stmt = conn.prepare("SELECT html FROM pages")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let html = row.get_ref(0)?.as_str()?;
+        for (i, _) in html.match_indices(PREFIX) {
+            let rest = &html[i + PREFIX.len()..];
+            let end = rest
+                .find(['"', '\'', '(', ')', '<', '>', ' ', '?', '#'])
+                .unwrap_or(rest.len());
+            let rel = percent_decode(&rest[..end].replace("&amp;", "&"));
+            if !rel.is_empty() && !rel.split('/').any(|part| part == "..") {
+                found.insert(rel);
+            }
+        }
+    }
+    Ok(found
+        .into_iter()
+        .filter(|rel| assets_dir.join(rel).is_file())
+        .collect())
+}
+
+/// Pack the database and `assets` the way the app's `download_and_setup`
 /// reads them: `stardewvalleydex.sqlite` plus `assets/...`.
-fn write_release_zip(data_dir: &Path, out: &Path) -> Result<usize, Error> {
+fn write_release_zip(data_dir: &Path, assets: &[String], out: &Path) -> Result<(), Error> {
     use zip::write::SimpleFileOptions;
     use zip::CompressionMethod;
 
@@ -361,52 +390,18 @@ fn write_release_zip(data_dir: &Path, out: &Path) -> Result<usize, Error> {
     std::io::copy(&mut File::open(data_dir.join(db::DB_FILE_NAME))?, &mut zip)?;
 
     let assets_dir = data_dir.join("assets");
-    let mut files = Vec::new();
-    collect_files(&assets_dir, &mut files)?;
-    files.retain(|f| !is_partial_download(f));
-    files.sort();
-
-    for path in &files {
-        let rel = path
-            .strip_prefix(&assets_dir)?
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        let compressible = matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("css" | "svg")
-        );
+    for rel in assets {
+        let compressible = rel.ends_with(".css") || rel.ends_with(".svg");
         zip.start_file(
             format!("assets/{rel}"),
             if compressible { deflated } else { stored },
         )?;
-        std::io::copy(&mut File::open(path)?, &mut zip)?;
+        std::io::copy(&mut File::open(assets_dir.join(rel))?, &mut zip)?;
     }
 
     zip.finish()?.flush()?;
     std::fs::rename(&tmp, out)?;
-    Ok(files.len())
-}
-
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            collect_files(&entry.path(), out)?;
-        } else {
-            out.push(entry.path());
-        }
-    }
     Ok(())
-}
-
-/// Temporary files the asset store writes before renaming (`x.png.part3`).
-fn is_partial_download(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.rsplit_once(".part"))
-        .is_some_and(|(_, n)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
 #[tokio::main]

@@ -19,7 +19,8 @@ pub fn link_targets(html: &str) -> impl Iterator<Item = String> + '_ {
             .replace('_', " ")
             .trim()
             .to_string();
-        (!target.is_empty() && !is_skipped_namespace(&target)).then_some(target)
+        let script = target.starts_with("mediawiki/") || target.ends_with(".php");
+        (!target.is_empty() && !script && !is_skipped_namespace(&target)).then_some(target)
     })
 }
 
@@ -67,6 +68,8 @@ mod tests {
             r#"<a href="wiki://localhost/Minera%C3%A7%C3%A3o#Andares">b</a>"#,
             r#"<a href="wiki://localhost/Peixe_&amp;_Fritas">c</a>"#,
             r#"<a href="wiki://localhost/Categoria:Peixes">skip</a>"#,
+            r#"<a href="wiki://localhost/Talk:Mining">skip</a>"#,
+            r#"<a href="wiki://localhost/mediawiki/index.php?title=X&amp;action=edit">skip</a>"#,
             r#"<a href="wiki://localhost/">skip</a>"#,
             r#"<img src="wiki://localhost/images/x.png">"#,
         );
