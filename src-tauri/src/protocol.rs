@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
@@ -20,7 +20,7 @@ pub fn register<R: Runtime>(
 fn handle_request<R: Runtime>(
     app: &tauri::AppHandle<R>,
     request: Request<Vec<u8>>,
-    assets_dir: &PathBuf,
+    assets_dir: &Path,
 ) -> Response<Vec<u8>> {
     let uri = request.uri();
     let raw_path = uri.path();
@@ -48,7 +48,9 @@ fn handle_request<R: Runtime>(
                     .body(BG.to_vec())
                     .unwrap_or_else(|_| internal_error("Failed to build response"));
             }
-            return serve_asset(assets_dir, &target, &ext);
+            // Asset files keep the underscores of their URL (`Foo_Bar.png`);
+            // the spaced name is a fallback for data stored that way.
+            return serve_asset(assets_dir, &[decoded.as_str(), target.as_str()], &ext);
         }
     }
 
@@ -176,22 +178,23 @@ fn inject_header(html: &str, title: &str) -> String {
     }
 }
 
-fn serve_asset(assets_dir: &PathBuf, rel_path: &str, ext: &str) -> Response<Vec<u8>> {
-    // Prevent path traversal.
-    if rel_path.contains("..") {
-        return not_found(rel_path);
+/// Serve the first of `candidates` (paths relative to `assets_dir`) that exists.
+fn serve_asset(assets_dir: &Path, candidates: &[&str], ext: &str) -> Response<Vec<u8>> {
+    for rel_path in candidates {
+        // Prevent path traversal.
+        if rel_path.contains("..") {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(assets_dir.join(rel_path)) {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", content_type_for(ext))
+                .header("Access-Control-Allow-Origin", "*")
+                .body(bytes)
+                .unwrap_or_else(|_| internal_error("Failed to build asset response"));
+        }
     }
-
-    let full = assets_dir.join(rel_path);
-    match std::fs::read(&full) {
-        Ok(bytes) => Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", content_type_for(ext))
-            .header("Access-Control-Allow-Origin", "*")
-            .body(bytes)
-            .unwrap_or_else(|_| internal_error("Failed to build asset response")),
-        Err(_) => not_found(rel_path),
-    }
+    not_found(candidates.first().copied().unwrap_or_default())
 }
 
 fn not_found(target: &str) -> Response<Vec<u8>> {
@@ -279,5 +282,37 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wiki::test_server::TempDir;
+
+    #[test]
+    fn serves_assets_whose_names_have_underscores() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(tmp.path().join("images")).unwrap();
+        std::fs::write(tmp.path().join("images/Foo_Bar.png"), b"underscore").unwrap();
+        std::fs::write(tmp.path().join("images/Old Name.png"), b"space").unwrap();
+
+        let resp = serve_asset(tmp.path(), &["images/Foo_Bar.png", "images/Foo Bar.png"], "png");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body(), b"underscore");
+
+        let resp = serve_asset(tmp.path(), &["images/Old_Name.png", "images/Old Name.png"], "png");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body(), b"space");
+
+        let resp = serve_asset(tmp.path(), &["images/Nope.png"], "png");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn refuses_path_traversal() {
+        let tmp = TempDir::new();
+        let resp = serve_asset(tmp.path(), &["../secret.png"], "png");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
