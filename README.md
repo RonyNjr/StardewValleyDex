@@ -12,9 +12,17 @@ Baixe o instalador para o seu sistema na página de [Releases](https://github.co
 |---------|---------|
 | Windows | `.msi` ou `.exe` |
 | macOS   | `.dmg` |
-| Linux   | `.AppImage` |
+| Linux   | `.AppImage`, `.deb` ou `.rpm` |
 
 > Na primeira execução o app baixa automaticamente os dados da wiki (~165 MB, com imagens). Depois disso funciona 100% offline.
+
+### Avisos na primeira instalação
+
+Os instaladores não têm a assinatura paga da Microsoft e da Apple, então o sistema pede uma confirmação na primeira vez:
+
+- **Windows:** se aparecer "O Windows protegeu o computador", clique em **Mais informações** → **Executar assim mesmo**.
+- **macOS:** abra o `.dmg` e arraste o app para **Aplicativos**. Se ao abrir aparecer que o app não pôde ser verificado, vá em **Ajustes do Sistema** → **Privacidade e Segurança** e clique em **Abrir Mesmo Assim**. No macOS 14 ou anterior, basta clicar com o botão direito no app → **Abrir**.
+- **Linux:** dê permissão de execução ao `.AppImage` (`chmod +x StardewValleyDex_*.AppImage`) ou instale o `.deb`/`.rpm` pelo gerenciador de pacotes.
 
 ---
 

@@ -60,11 +60,16 @@ jobs:
             ## Download
 
             Escolha o instalador para o seu sistema:
-            - **Windows**: baixe o `.msi` (recomendado) ou `.exe`
-            - **macOS**: baixe o `.dmg`
-            - **Linux**: baixe o `.AppImage`
+            - **Windows**: baixe o `.exe` ou o `.msi`
+            - **macOS**: baixe o `.dmg` (Intel e Apple Silicon)
+            - **Linux**: baixe o `.AppImage`, o `.deb` ou o `.rpm`
 
             Após instalar, o app baixa os dados automaticamente na primeira execução (~165 MB).
+
+            ### Primeira abertura
+            Os instaladores não têm a assinatura paga da Microsoft e da Apple:
+            - **Windows**: em "O Windows protegeu o computador", clique em **Mais informações** → **Executar assim mesmo**.
+            - **macOS**: se o app não puder ser verificado, vá em **Ajustes do Sistema** → **Privacidade e Segurança** → **Abrir Mesmo Assim** (macOS 14 ou anterior: botão direito no app → **Abrir**).
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
