@@ -14,7 +14,7 @@ Baixe o instalador para o seu sistema na página de [Releases](https://github.co
 | macOS   | `.dmg` |
 | Linux   | `.AppImage` |
 
-> Na primeira execução o app baixa automaticamente os dados da wiki (~70 MB). Depois disso funciona 100% offline.
+> Na primeira execução o app baixa automaticamente os dados da wiki (~165 MB, com imagens). Depois disso funciona 100% offline.
 
 ---
 

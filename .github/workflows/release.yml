@@ -64,7 +64,7 @@ jobs:
             - **macOS**: baixe o `.dmg`
             - **Linux**: baixe o `.AppImage`
 
-            Após instalar, o app baixa os dados automaticamente na primeira execução (~70 MB).
+            Após instalar, o app baixa os dados automaticamente na primeira execução (~165 MB).
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
