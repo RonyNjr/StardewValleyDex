@@ -1,6 +1,7 @@
-mod db;
+pub mod db;
 mod protocol;
 mod sync;
+pub mod wiki;
 
 use std::sync::{Arc, Mutex};
 
@@ -34,10 +35,7 @@ fn navigate_to(
 #[tauri::command]
 fn check_setup(state: tauri::State<'_, Mutex<Connection>>) -> Result<bool, String> {
     let conn = state.lock().map_err(|_| "mutex poisoned".to_string())?;
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM pages", [], |r| r.get(0))
-        .unwrap_or(0);
-    Ok(count > 0)
+    Ok(db::page_count(&conn).unwrap_or(0) > 0)
 }
 
 /// Downloads the data zip from `url`, extracts the SQLite DB and assets,
@@ -139,10 +137,24 @@ async fn download_and_setup(
         conn.execute_batch(&format!(
             "ATTACH DATABASE '{src}' AS src;
              INSERT OR REPLACE INTO pages SELECT * FROM src.pages;
-             INSERT OR REPLACE INTO redirects SELECT * FROM src.redirects;
-             DETACH DATABASE src;"
+             INSERT OR REPLACE INTO redirects SELECT * FROM src.redirects;"
         ))
         .map_err(|e| format!("Falha ao importar: {e}"))?;
+        // Data made by the Rust dump records when it was taken, so the sync
+        // knows which wiki changes are newer than the downloaded pages.
+        let has_sync_state: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM src.sqlite_master WHERE type='table' AND name='sync_state')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if has_sync_state {
+            conn.execute_batch("INSERT OR REPLACE INTO sync_state SELECT key, value FROM src.sync_state;")
+                .map_err(|e| format!("Falha ao importar: {e}"))?;
+        }
+        conn.execute_batch("DETACH DATABASE src;")
+            .map_err(|e| format!("Falha ao importar: {e}"))?;
     }
 
     std::fs::remove_file(&temp_sqlite).ok();
@@ -176,12 +188,12 @@ pub fn run() {
             let real_assets = app_data_dir.join("assets");
             std::fs::create_dir_all(&real_assets).ok();
 
-            *assets_dir.lock().unwrap() = real_assets;
+            *assets_dir.lock().unwrap() = real_assets.clone();
 
             let conn = db::init_db(&app_data_dir).expect("failed to initialise database");
             app.manage(Mutex::new(conn));
 
-            sync::start(app.handle().clone());
+            sync::start(app.handle().clone(), real_assets);
 
             Ok(())
         })

@@ -41,16 +41,29 @@ Baixe o instalador para o seu sistema na página de [Releases](https://github.co
 | Backend / protocolo | Rust (`wiki://` custom scheme) |
 | Banco de dados | SQLite (páginas HTML + metadados) |
 | Frontend | TypeScript + Vite |
-| Scraper (build tool) | Python + BeautifulSoup |
+| Dump da wiki (build tool) | Rust (`src-tauri/examples/dump.rs`) |
 
 ---
 
 ## ⚙️ Como funciona
 
-1. O script `scripts/dump.py` faz o scraping da wiki PT (com fallback EN) e salva tudo em SQLite
+1. O dump (`src-tauri/examples/dump.rs`) baixa a wiki PT (com fallback EN), reescreve links e imagens para `wiki://localhost/` e salva tudo em SQLite
 2. O app Tauri serve as páginas via protocolo customizado `wiki://localhost/NomeDaPágina`
 3. O header customizado é injetado em cada página servida pelo backend Rust
 4. Na primeira execução em uma máquina nova, o app baixa o zip de dados do GitHub Releases e importa automaticamente
+5. Com o app aberto, a cada 30 min o sync baixa de novo as páginas editadas na wiki, usando o mesmo código do dump
+
+### Gerar os dados
+
+```bash
+cd src-tauri
+cargo run --release --example dump -- --limit 5      # teste rápido
+cargo run --release --example dump                   # dump completo
+cargo run --release --example dump -- --resume --crawl-missing
+cargo run --release --example dump -- --help         # todas as opções
+```
+
+Por padrão os dados vão para a pasta de dados do app (`~/.local/share/com.stardewvalleydex.app` no Linux, `~/Library/Application Support/com.stardewvalleydex.app` no macOS, `%APPDATA%\com.stardewvalleydex.app` no Windows). Use `--data-dir` para outro lugar.
 
 ---
 
@@ -63,11 +76,12 @@ StardewValleyDex/
 │   ├── src/
 │   │   ├── lib.rs     # Comandos Tauri (setup, navegação)
 │   │   ├── protocol.rs # Servidor wiki:// + injeção de header
-│   │   └── db.rs      # Queries SQLite
+│   │   ├── db.rs      # Queries SQLite
+│   │   ├── sync.rs    # Atualização periódica das páginas editadas
+│   │   └── wiki/      # Download, reescrita de HTML e assets (usado pelo dump e pelo sync)
+│   ├── examples/
+│   │   └── dump.rs    # Dump inicial da wiki (--crawl-missing disponível)
 │   └── resources/     # Assets bundled no binário
-├── scripts/
-│   ├── dump.py        # Scraper principal (--crawl-missing disponível)
-│   └── make_release.py # Gera o zip de dados para release
 └── .github/workflows/ # CI/CD para builds multi-plataforma
 ```
 
