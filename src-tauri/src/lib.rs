@@ -31,11 +31,23 @@ fn navigate_to(
     }
 }
 
-/// Returns true if the local DB already has wiki pages (setup done).
+#[derive(serde::Serialize)]
+struct SetupStatus {
+    /// The local DB has wiki pages.
+    has_data: bool,
+    /// ...in the current format (`db::DATA_VERSION`). When false but
+    /// `has_data` is true, the frontend downloads the new package once and
+    /// falls back to the existing pages if that fails (e.g. offline).
+    up_to_date: bool,
+}
+
 #[tauri::command]
-fn check_setup(state: tauri::State<'_, Mutex<Connection>>) -> Result<bool, String> {
+fn check_setup(state: tauri::State<'_, Mutex<Connection>>) -> Result<SetupStatus, String> {
     let conn = state.lock().map_err(|_| "mutex poisoned".to_string())?;
-    Ok(db::page_count(&conn).unwrap_or(0) > 0)
+    Ok(SetupStatus {
+        has_data: db::page_count(&conn).unwrap_or(0) > 0,
+        up_to_date: db::data_up_to_date(&conn).unwrap_or(false),
+    })
 }
 
 /// Downloads the data zip from `url`, extracts the SQLite DB and assets,
@@ -128,36 +140,12 @@ async fn download_and_setup(
     )
     .ok();
 
-    {
+    let imported = {
         let conn = state.lock().map_err(|_| "mutex poisoned".to_string())?;
-        let src = temp_sqlite
-            .to_str()
-            .ok_or("caminho temporário inválido")?
-            .replace('\'', "''"); // basic SQL escape
-        conn.execute_batch(&format!(
-            "ATTACH DATABASE '{src}' AS src;
-             INSERT OR REPLACE INTO pages SELECT * FROM src.pages;
-             INSERT OR REPLACE INTO redirects SELECT * FROM src.redirects;"
-        ))
-        .map_err(|e| format!("Falha ao importar: {e}"))?;
-        // Data made by the Rust dump records when it was taken, so the sync
-        // knows which wiki changes are newer than the downloaded pages.
-        let has_sync_state: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM src.sqlite_master WHERE type='table' AND name='sync_state')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(false);
-        if has_sync_state {
-            conn.execute_batch("INSERT OR REPLACE INTO sync_state SELECT key, value FROM src.sync_state;")
-                .map_err(|e| format!("Falha ao importar: {e}"))?;
-        }
-        conn.execute_batch("DETACH DATABASE src;")
-            .map_err(|e| format!("Falha ao importar: {e}"))?;
-    }
-
+        db::import_data(&conn, &temp_sqlite).map_err(|e| format!("Falha ao importar: {e}"))
+    };
     std::fs::remove_file(&temp_sqlite).ok();
+    imported?;
 
     app.emit(
         "setup_progress",

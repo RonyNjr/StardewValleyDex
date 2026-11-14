@@ -56,7 +56,8 @@ pub fn start(app_handle: tauri::AppHandle, assets_dir: PathBuf) {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SyncReport {
-    /// True when the pass did nothing because the initial data isn't there.
+    /// True when the pass did nothing because the data package is missing
+    /// or outdated (a fresh download is pending).
     pub skipped_no_data: bool,
     pub updated: usize,
     /// Pages left untouched on purpose (gone upstream or now a redirect).
@@ -71,10 +72,11 @@ pub async fn run_sync_pass(
 ) -> Result<SyncReport, Error> {
     let cursor = {
         let conn = lock(db)?;
-        // Before the first data import the database is empty. Writing a few
-        // synced pages into it would make `check_setup` report the app as
-        // ready and skip the real download.
-        if db::page_count(&conn)? == 0 {
+        // Before the data package is imported (or while an outdated one is
+        // waiting to be replaced) there's nothing worth syncing. Writing a
+        // few pages into an empty database would also make `check_setup`
+        // report the app as ready and skip the real download.
+        if !db::data_up_to_date(&conn)? {
             return Ok(SyncReport {
                 skipped_no_data: true,
                 ..Default::default()
@@ -147,6 +149,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         db::create_schema(&conn).unwrap();
         db::upsert_page(&conn, "Abacaxi", ORIGINAL, "dump", "Frutas").unwrap();
+        db::set_data_version(&conn, db::DATA_VERSION).unwrap();
         db::set_sync_cursor(
             &conn,
             &SyncCursor {
@@ -360,6 +363,24 @@ mod tests {
 
         assert!(report.skipped_no_data);
         assert_eq!(db::page_count(&db.lock().unwrap()).unwrap(), 0);
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn does_nothing_while_the_data_is_outdated() {
+        let server = wiki(&["Abacaxi"], |_| {
+            Reply::html(200, "<html><body>x</body></html>")
+        })
+        .await;
+        let tmp = TempDir::new();
+        let client = WikiClient::new(test_config(&server.base, tmp.path())).unwrap();
+        let db = db_with_page();
+        db::set_data_version(&db.lock().unwrap(), db::DATA_VERSION - 1).unwrap();
+
+        let report = run_sync_pass(&client, &db).await.unwrap();
+
+        assert!(report.skipped_no_data);
+        assert_eq!(stored_html(&db, "Abacaxi").as_deref(), Some(ORIGINAL));
         assert!(server.requests().is_empty());
     }
 }

@@ -288,6 +288,11 @@ async fn run(args: Args) -> Result<bool, Error> {
 
         // The sync fetches wiki changes made after this point. A resumed
         // dump only fills gaps, so it must not move an existing cursor.
+        // A full dump is data in the current format; a resumed one may
+        // still hold pages from an older dump, so it keeps its marker.
+        if !args.resume {
+            db::set_data_version(&conn, db::DATA_VERSION)?;
+        }
         if !args.resume || db::get_sync_cursor(&conn)?.is_none() {
             db::set_sync_cursor(
                 &conn,
