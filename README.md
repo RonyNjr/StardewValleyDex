@@ -50,7 +50,7 @@ Baixe o instalador para o seu sistema na página de [Releases](https://github.co
 1. O dump (`src-tauri/examples/dump.rs`) baixa a wiki PT (com fallback EN), reescreve links e imagens para `wiki://localhost/` e salva tudo em SQLite
 2. O app Tauri serve as páginas via protocolo customizado `wiki://localhost/NomeDaPágina`
 3. O header customizado é injetado em cada página servida pelo backend Rust
-4. Na primeira execução em uma máquina nova, o app baixa o zip de dados do GitHub Releases e importa automaticamente
+4. Na primeira execução em uma máquina nova, o app baixa o zip de dados do GitHub Releases e importa automaticamente. Quando o formato dos dados muda (`DATA_VERSION` em `db.rs`), quem já tem o app baixa o pacote novo uma vez; sem internet, continua com os dados que já tem
 5. Com o app aberto, a cada 30 min o sync baixa de novo as páginas editadas na wiki, usando o mesmo código do dump
 
 ### Gerar os dados

@@ -90,6 +90,66 @@ pub fn page_count(conn: &Connection) -> Result<i64> {
     conn.query_row("SELECT COUNT(*) FROM pages", [], |r| r.get(0))
 }
 
+/// Format of the data package. Bump it when installed data must be
+/// replaced by a fresh download (2 = Rust dump, images stored offline).
+pub const DATA_VERSION: i64 = 2;
+const DATA_VERSION_KEY: &str = "data_version";
+
+/// Version of the data in this database (0 = made before versioning).
+pub fn data_version(conn: &Connection) -> Result<i64> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = ?1",
+            params![DATA_VERSION_KEY],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(value.and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+pub fn set_data_version(conn: &Connection, version: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![DATA_VERSION_KEY, version.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Pages are there and in the current format.
+pub fn data_up_to_date(conn: &Connection) -> Result<bool> {
+    Ok(page_count(conn)? > 0 && data_version(conn)? >= DATA_VERSION)
+}
+
+/// Replace all pages and redirects with those of the database at `src`
+/// (an extracted data package) and take over its sync state. Runs in one
+/// transaction: if anything fails, the current data stays untouched.
+pub fn import_data(conn: &Connection, src: &Path) -> Result<()> {
+    conn.execute("ATTACH DATABASE ?1 AS src", params![src.to_string_lossy()])?;
+    let imported = (|| {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "DELETE FROM pages;
+             DELETE FROM redirects;
+             INSERT OR REPLACE INTO pages SELECT * FROM src.pages;
+             INSERT OR REPLACE INTO redirects SELECT * FROM src.redirects;",
+        )?;
+        let has_sync_state: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM src.sqlite_master WHERE type='table' AND name='sync_state')",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_sync_state {
+            tx.execute_batch(
+                "INSERT OR REPLACE INTO sync_state SELECT key, value FROM src.sync_state;",
+            )?;
+        }
+        tx.commit()
+    })();
+    let detached = conn.execute_batch("DETACH DATABASE src");
+    imported.and(detached)
+}
+
 /// Every title that already resolves locally: pages and redirect sources.
 pub fn stored_titles(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt =
@@ -215,6 +275,78 @@ mod tests {
         upsert_redirect(&conn, "Velho", "Novo").unwrap();
         assert_eq!(get_page(&conn, "Velho").as_deref(), Some("<p>novo</p>"));
         assert_eq!(stored_titles(&conn).unwrap(), vec!["Novo", "Velho"]);
+    }
+
+    fn data_package(
+        dir: &Path,
+        pages: &[(&str, &str)],
+        version: Option<i64>,
+    ) -> std::path::PathBuf {
+        let path = dir.join("pkg.sqlite");
+        let src = Connection::open(&path).unwrap();
+        create_schema(&src).unwrap();
+        for (title, html) in pages {
+            upsert_page(&src, title, html, "t", "").unwrap();
+        }
+        if let Some(v) = version {
+            set_data_version(&src, v).unwrap();
+            set_sync_cursor(
+                &src,
+                &SyncCursor {
+                    timestamp: "2026-11-14T15:00:00Z".into(),
+                    rcid: 0,
+                },
+            )
+            .unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn outdated_data_is_replaced_by_the_import() {
+        let tmp = crate::wiki::test_server::TempDir::new();
+        let conn = conn();
+        // Data from the old Python dump: pages, no version.
+        upsert_page(&conn, "Barco", "<p>velho</p>", "t", "").unwrap();
+        upsert_page(&conn, "Talk:Mining", "<p>lixo</p>", "t", "").unwrap();
+        upsert_redirect(&conn, "Velho", "Barco").unwrap();
+        assert!(!data_up_to_date(&conn).unwrap());
+
+        let pkg = data_package(
+            tmp.path(),
+            &[("\"Barco\"", "<p>novo</p>")],
+            Some(DATA_VERSION),
+        );
+        import_data(&conn, &pkg).unwrap();
+
+        assert!(data_up_to_date(&conn).unwrap());
+        assert_eq!(page_count(&conn).unwrap(), 1);
+        assert_eq!(get_page(&conn, "Barco").as_deref(), Some("<p>novo</p>"));
+        assert_eq!(get_page(&conn, "Velho"), None);
+        assert_eq!(
+            get_sync_cursor(&conn).unwrap().unwrap().timestamp,
+            "2026-11-14T15:00:00Z"
+        );
+    }
+
+    #[test]
+    fn failed_import_keeps_the_current_data() {
+        let tmp = crate::wiki::test_server::TempDir::new();
+        let conn = conn();
+        upsert_page(&conn, "Barco", "<p>atual</p>", "t", "").unwrap();
+        // A file that isn't a data package.
+        let bogus = tmp.path().join("bogus.sqlite");
+        Connection::open(&bogus)
+            .unwrap()
+            .execute_batch("CREATE TABLE x (y)")
+            .unwrap();
+
+        assert!(import_data(&conn, &bogus).is_err());
+        assert_eq!(get_page(&conn, "Barco").as_deref(), Some("<p>atual</p>"));
+        // Still usable afterwards (src was detached).
+        let pkg = data_package(tmp.path(), &[("Barco", "<p>novo</p>")], Some(DATA_VERSION));
+        import_data(&conn, &pkg).unwrap();
+        assert_eq!(get_page(&conn, "Barco").as_deref(), Some("<p>novo</p>"));
     }
 
     #[test]

@@ -1,9 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-// Update this URL after creating the GitHub Release and uploading the zip.
+// Data package built with `cargo run --release --example dump -- --zip ...`
+// and published as a GitHub release asset. Its format must match
+// `DATA_VERSION` in src-tauri/src/db.rs.
 const DATA_URL =
-  "https://github.com/RonyNjr/StardewValleyDex/releases/download/v1.0.0/stardewvalleydex-data.zip";
+  "https://github.com/RonyNjr/StardewValleyDex/releases/download/dados-2026-11/stardewvalleydex-data.zip";
+
+type SetupStatus = { has_data: boolean; up_to_date: boolean };
+
+function openWiki() {
+  window.location.href = "wiki://localhost/";
+}
 
 const STEPS: Record<string, string> = {
   downloading: "A descarregar dados da wiki...",
@@ -13,13 +21,13 @@ const STEPS: Record<string, string> = {
 };
 
 async function main() {
-  const ready = await invoke<boolean>("check_setup");
-  if (ready) {
-    window.location.href = "wiki://localhost/";
+  const setup = await invoke<SetupStatus>("check_setup");
+  if (setup.has_data && setup.up_to_date) {
+    openWiki();
     return;
   }
 
-  showDownloadUI();
+  showDownloadUI(setup.has_data);
 
   const status = document.getElementById("svd-status")!;
   const bar = document.getElementById("svd-bar")!;
@@ -31,21 +39,29 @@ async function main() {
     bar.style.width = `${p}%`;
     pct.textContent = `${p}%`;
     if (step === "done") {
-      setTimeout(() => {
-        window.location.href = "wiki://localhost/";
-      }, 800);
+      setTimeout(openWiki, 800);
     }
   });
 
   try {
     await invoke("download_and_setup", { url: DATA_URL });
   } catch (e) {
-    status.textContent = `Erro: ${e}`;
     bar.style.background = "#e74c3c";
+    if (setup.has_data) {
+      // Offline or download failed: keep using the pages already stored.
+      // The update is tried again on the next start.
+      status.textContent = "Não foi possível baixar a atualização. A abrir os dados atuais…";
+      setTimeout(openWiki, 2500);
+    } else {
+      status.textContent = `Erro: ${e}`;
+    }
   }
 }
 
-function showDownloadUI() {
+function showDownloadUI(updating: boolean) {
+  const intro = updating
+    ? "A atualizar os dados da wiki (agora com imagens offline)…"
+    : "A preparar dados iniciais…";
   document.body.innerHTML = `
     <div style="
       font-family: sans-serif;
@@ -62,7 +78,7 @@ function showDownloadUI() {
       <img src="/src/assets/stardew-icon.png" style="width:72px;height:72px;object-fit:contain;border-radius:12px" onerror="this.style.display='none'">
       <h1 style="margin:0;font-size:2rem;letter-spacing:.5px">StardewValleyDex</h1>
       <p id="svd-status" style="margin:0;font-size:1.05rem;opacity:.9">
-        A preparar dados iniciais…
+        ${intro}
       </p>
       <div style="width:420px;background:rgba(255,255,255,.2);border-radius:8px;overflow:hidden;height:18px">
         <div id="svd-bar" style="height:100%;width:0%;background:#f4c430;transition:width .4s ease"></div>
