@@ -61,6 +61,9 @@ cargo run --release --example dump -- --limit 5      # teste rápido
 cargo run --release --example dump                   # dump completo
 cargo run --release --example dump -- --resume --crawl-missing
 cargo run --release --example dump -- --help         # todas as opções
+
+# zip de dados do release (o que o app baixa na primeira execução)
+cargo run --release --example dump -- --crawl-missing --data-dir ../dump --zip ../stardewvalleydex-data.zip
 ```
 
 Por padrão os dados vão para a pasta de dados do app (`~/.local/share/com.stardewvalleydex.app` no Linux, `~/Library/Application Support/com.stardewvalleydex.app` no macOS, `%APPDATA%\com.stardewvalleydex.app` no Windows). Use `--data-dir` para outro lugar.
