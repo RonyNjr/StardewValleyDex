@@ -26,7 +26,7 @@ pub struct WikiConfig {
     pub page_delay: Duration,
     /// Pause between paginated API requests.
     pub api_delay: Duration,
-    /// Retries for connection errors, timeouts and HTTP 500/502/503/504.
+    /// Retries for connection errors, timeouts and HTTP 429/500/502/503/504.
     pub retries: u32,
     /// Backoff before the first retry; doubles on each attempt.
     pub retry_delay: Duration,
@@ -161,7 +161,7 @@ impl WikiClient {
         loop {
             let result = self.http.get(url).send().await;
             let transient = match &result {
-                Ok(resp) => matches!(resp.status().as_u16(), 500 | 502 | 503 | 504),
+                Ok(resp) => matches!(resp.status().as_u16(), 429 | 500 | 502 | 503 | 504),
                 Err(e) => e.is_timeout() || e.is_connect(),
             };
             if !transient || attempt >= self.cfg.retries {
@@ -325,8 +325,22 @@ impl WikiClient {
         }
     }
 
+    /// Assets kept offline: relative and protocol-relative URLs (as the old
+    /// dump did) and anything hosted on either wiki. Most content images on
+    /// the Portuguese wiki are absolute URLs on the English one.
+    fn is_wiki_asset(&self, url: &str) -> bool {
+        url.starts_with('/')
+            || [&self.cfg.pt_base, &self.cfg.en_base].iter().any(|base| {
+                url.strip_prefix(base.trim_end_matches('/'))
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+    }
+
     async fn process(&self, raw: &str, page_base: &str) -> ProcessedPage {
-        let resolved: HashMap<AssetRef, String> = stream::iter(html::collect_assets(raw))
+        let assets = html::collect_assets(raw)
+            .into_iter()
+            .filter(|asset| self.is_wiki_asset(&asset.url));
+        let resolved: HashMap<AssetRef, String> = stream::iter(assets)
             .map(|asset| async move {
                 let rel = self.assets.fetch(self, &asset, page_base).await;
                 rel.map(|rel| (asset, rel))
@@ -502,6 +516,53 @@ mod tests {
         assert_eq!(
             std::fs::read(tmp.path().join("images/a/ab/Abacaxi.png")).unwrap(),
             b"PNGDATA"
+        );
+        assert_eq!(client.assets().downloaded(), 1);
+    }
+
+    #[tokio::test]
+    async fn stores_images_hosted_on_the_english_wiki() {
+        // The page needs the server's address, known only after it starts.
+        let base = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+        let page_base = std::sync::Arc::clone(&base);
+        let server = TestServer::start(move |target| match target {
+            "/Pesca" => {
+                let base = page_base.get().unwrap();
+                Reply::html(
+                    200,
+                    &format!(
+                        r#"<html><body><img src="{base}/en/mediawiki/images/en/0/07/%27Boat%27_Location.png"><img src="https://example.invalid/ad.png"></body></html>"#
+                    ),
+                )
+            }
+            "/en/mediawiki/images/en/0/07/%27Boat%27_Location.png" => {
+                Reply::bytes("image/png", b"BOAT")
+            }
+            _ => Reply::status(404),
+        })
+        .await;
+        base.set(server.base.clone()).unwrap();
+        let tmp = TempDir::new();
+        let client = WikiClient::new(test_config(&server.base, tmp.path())).unwrap();
+
+        let PageOutcome::Page { page, .. } = client.fetch_page("Pesca").await.unwrap() else {
+            panic!("expected a page");
+        };
+        assert!(page.html.contains(
+            r#"src="wiki://localhost/en/mediawiki/images/en/0/07/%27Boat%27_Location.png""#
+        ));
+        assert!(
+            page.html
+                .contains(r#"src="https://example.invalid/ad.png""#),
+            "images on other hosts are left alone"
+        );
+        assert_eq!(
+            std::fs::read(
+                tmp.path()
+                    .join("en/mediawiki/images/en/0/07/'Boat'_Location.png")
+            )
+            .unwrap(),
+            b"BOAT"
         );
         assert_eq!(client.assets().downloaded(), 1);
     }

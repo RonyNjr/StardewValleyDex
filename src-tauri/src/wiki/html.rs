@@ -6,8 +6,18 @@
 use std::collections::HashSet;
 
 use dom_query::Document;
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 use super::{title_to_slug, utc_now, EN_BASE};
+
+/// Escapes asset paths in `wiki://localhost/` URLs, so names with `#`, `?`,
+/// `+`, `'` or non-ASCII characters reach the protocol handler intact.
+const ASSET_PATH_ESCAPE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
 
 /// MediaWiki chrome and scripts removed from every page.
 const STRIP_SELECTOR: &str = "#mw-head, #mw-head-base, #mw-page-base, script";
@@ -72,23 +82,33 @@ fn parse_clean(html: &str) -> Document {
     doc
 }
 
+fn is_fetchable(url: &str) -> bool {
+    !url.is_empty() && !url.starts_with("data:")
+}
+
 fn image_asset(src: &str) -> Option<AssetRef> {
-    // Same-origin and protocol-relative images only; `data:` URIs and
-    // absolute URLs are left alone.
-    src.starts_with('/').then(|| AssetRef {
+    is_fetchable(src).then(|| AssetRef {
         url: src.to_string(),
         kind: AssetKind::Image,
     })
 }
 
 fn stylesheet_asset(rel: Option<&str>, href: &str) -> Option<AssetRef> {
-    (rel.is_some_and(|r| r.contains("stylesheet")) && href.starts_with('/')).then(|| AssetRef {
+    (rel.is_some_and(|r| r.contains("stylesheet")) && is_fetchable(href)).then(|| AssetRef {
         url: href.to_string(),
         kind: AssetKind::Stylesheet,
     })
 }
 
-/// Assets the page needs offline, in document order, without duplicates.
+fn local_url(rel: &str) -> String {
+    format!(
+        "wiki://localhost/{}",
+        utf8_percent_encode(rel, ASSET_PATH_ESCAPE)
+    )
+}
+
+/// Every image and stylesheet the page references, in document order,
+/// without duplicates. The caller decides which ones to store offline.
 pub fn collect_assets(html: &str) -> Vec<AssetRef> {
     let doc = parse_clean(html);
     let mut seen = HashSet::new();
@@ -136,7 +156,7 @@ pub fn process_html(html: &str, resolve: impl Fn(&AssetRef) -> Option<String>) -
             .and_then(|s| image_asset(&s))
             .and_then(|asset| resolve(&asset));
         if let Some(rel) = local {
-            img.set_attr("src", &format!("wiki://localhost/{rel}"));
+            img.set_attr("src", &local_url(&rel));
         }
     }
 
@@ -147,7 +167,7 @@ pub fn process_html(html: &str, resolve: impl Fn(&AssetRef) -> Option<String>) -
             .and_then(|h| stylesheet_asset(rel.as_deref(), &h))
             .and_then(|asset| resolve(&asset));
         if let Some(path) = local {
-            link.set_attr("href", &format!("wiki://localhost/{path}"));
+            link.set_attr("href", &local_url(&path));
         }
     }
 
@@ -219,6 +239,8 @@ mod tests {
   <a href="#topo">topo</a>
   <img src="/images/a/ab/Foo.png" srcset="/images/a/ab/Foo2x.png 2x">
   <img src="//stardewvalleywiki.com/images/b/bc/Bar.png">
+  <img src="https://stardewvalleywiki.com/mediawiki/images/en/0/07/%27Boat%27_Location.png">
+  <img src="https://example.com/ad.png">
   <img src="data:image/png;base64,AAAA">
   <img src="/images/missing.png">
 </div>
@@ -261,6 +283,15 @@ mod tests {
                     kind: AssetKind::Image
                 },
                 AssetRef {
+                    url: "https://stardewvalleywiki.com/mediawiki/images/en/0/07/%27Boat%27_Location.png"
+                        .into(),
+                    kind: AssetKind::Image
+                },
+                AssetRef {
+                    url: "https://example.com/ad.png".into(),
+                    kind: AssetKind::Image
+                },
+                AssetRef {
                     url: "/images/missing.png".into(),
                     kind: AssetKind::Image
                 },
@@ -278,6 +309,9 @@ mod tests {
         let page = process_html(PAGE, |asset| match asset.url.as_str() {
             "/images/a/ab/Foo.png" => Some("images/a/ab/Foo.png".into()),
             "//stardewvalleywiki.com/images/b/bc/Bar.png" => Some("images/b/bc/Bar.png".into()),
+            "https://stardewvalleywiki.com/mediawiki/images/en/0/07/%27Boat%27_Location.png" => {
+                Some("mediawiki/images/en/0/07/'Boat'_Location #2+.png".into())
+            }
             u if u.starts_with("/mediawiki/load.php") => Some("css/abc.css".into()),
             _ => None,
         });
@@ -296,6 +330,13 @@ mod tests {
         assert!(html.contains(r##"href="#topo""##));
         assert!(html.contains(r#"src="wiki://localhost/images/a/ab/Foo.png" srcset="""#));
         assert!(html.contains(r#"src="wiki://localhost/images/b/bc/Bar.png""#));
+        assert!(html.contains(
+            r#"src="wiki://localhost/mediawiki/images/en/0/07/%27Boat%27_Location%20%232%2B.png""#
+        ));
+        assert!(
+            html.contains(r#"src="https://example.com/ad.png""#),
+            "unresolved absolute images keep their URL"
+        );
         assert!(html.contains(r#"src="data:image/png;base64,AAAA""#));
         assert!(
             html.contains(r#"src="/images/missing.png""#),
