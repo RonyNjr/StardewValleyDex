@@ -15,7 +15,9 @@
 //! Run with `--help` for the options.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -47,6 +49,8 @@ Options:
   --max-pages N         Cap on pages added by the crawl (default: 5000).
   --verbose-assets      Print every asset download.
   --no-ssl-verify       Don't verify TLS certificates.
+  --zip PATH            When done, pack the database and assets into PATH,
+                        in the layout the app downloads on first run.
   -h, --help            Show this help.";
 
 struct Args {
@@ -59,6 +63,7 @@ struct Args {
     max_pages: usize,
     verbose_assets: bool,
     no_ssl_verify: bool,
+    zip: Option<PathBuf>,
 }
 
 enum Parsed {
@@ -79,6 +84,7 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Parsed, String> 
         max_pages: DEFAULT_MAX_PAGES,
         verbose_assets: false,
         no_ssl_verify: false,
+        zip: None,
     };
 
     while let Some(arg) = argv.next() {
@@ -112,6 +118,7 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Parsed, String> 
             "--max-pages" => args.max_pages = number("--max-pages", value("--max-pages")?)?,
             "--verbose-assets" => args.verbose_assets = true,
             "--no-ssl-verify" => args.no_ssl_verify = true,
+            "--zip" => args.zip = Some(PathBuf::from(value("--zip")?)),
             other => return Err(format!("unknown option {other:?}")),
         }
     }
@@ -312,7 +319,94 @@ async fn run(args: Args) -> Result<bool, Error> {
         );
     }
 
+    if let Some(zip_path) = &args.zip {
+        // Fold the WAL back in so the packed database is one self-contained file.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE; VACUUM;")?;
+        drop(conn);
+        println!();
+        println!("Writing {} ...", zip_path.display());
+        let files = write_release_zip(&args.data_dir, zip_path)?;
+        let size = std::fs::metadata(zip_path)?.len();
+        println!(
+            "  {} assets + database, {:.1} MB",
+            files,
+            size as f64 / 1_000_000.0
+        );
+    }
+
     Ok(failed == 0)
+}
+
+/// Pack the database and assets the way the app's `download_and_setup`
+/// reads them: `stardewvalleydex.sqlite` plus `assets/...`.
+fn write_release_zip(data_dir: &Path, out: &Path) -> Result<usize, Error> {
+    use zip::write::SimpleFileOptions;
+    use zip::CompressionMethod;
+
+    let deflated = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .large_file(true);
+    // Images are already compressed: storing them is as small and much faster.
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Build next to the target and rename at the end, so an interrupted run
+    // never leaves a truncated zip behind under the final name.
+    let tmp = out.with_extension("zip.part");
+    let mut zip = zip::ZipWriter::new(BufWriter::new(File::create(&tmp)?));
+
+    zip.start_file(db::DB_FILE_NAME, deflated)?;
+    std::io::copy(&mut File::open(data_dir.join(db::DB_FILE_NAME))?, &mut zip)?;
+
+    let assets_dir = data_dir.join("assets");
+    let mut files = Vec::new();
+    collect_files(&assets_dir, &mut files)?;
+    files.retain(|f| !is_partial_download(f));
+    files.sort();
+
+    for path in &files {
+        let rel = path
+            .strip_prefix(&assets_dir)?
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let compressible = matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("css" | "svg")
+        );
+        zip.start_file(
+            format!("assets/{rel}"),
+            if compressible { deflated } else { stored },
+        )?;
+        std::io::copy(&mut File::open(path)?, &mut zip)?;
+    }
+
+    zip.finish()?.flush()?;
+    std::fs::rename(&tmp, out)?;
+    Ok(files.len())
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            collect_files(&entry.path(), out)?;
+        } else {
+            out.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+/// Temporary files the asset store writes before renaming (`x.png.part3`).
+fn is_partial_download(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.rsplit_once(".part"))
+        .is_some_and(|(_, n)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
 #[tokio::main]
